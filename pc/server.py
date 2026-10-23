@@ -30,6 +30,25 @@ MODE_MIC = 1
 MODE_SPEAKER = 2
 DEFAULT_PORT = 5800
 VBCABLE_URL = "https://vb-audio.com/Cable/"
+SINGLE_PORT = 47653  # trava local para permitir só uma janela aberta
+
+
+def acquire_single_instance():
+    """Retorna um socket-trava se esta é a única instância; senão avisa a
+    janela já aberta (para ir à frente) e retorna None."""
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", SINGLE_PORT))
+        lock.listen(1)
+        return lock
+    except OSError:
+        lock.close()
+        try:
+            with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=2) as c:
+                c.sendall(b"show")
+        except OSError:
+            pass
+        return None
 
 
 def recv_exact(conn, n):
@@ -289,8 +308,9 @@ class FlatButton(tk.Label):
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, lock=None):
         self.root = root
+        self.lock_sock = lock
         self.cfg = load_config()
         self.server = None
         self.muted = False
@@ -368,6 +388,21 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.hide)
         self._start_tray()
         self.poll()
+        if lock is not None:
+            threading.Thread(target=self._listen_show, args=(lock,), daemon=True).start()
+
+    def _listen_show(self, lock):
+        while True:
+            try:
+                conn, _ = lock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(8)
+                except OSError:
+                    pass
+            self.ui_q.put("show")  # traz a janela existente à frente
 
     def refresh_devices(self):
         self.devices = list_output_devices()
@@ -522,10 +557,18 @@ class App:
             self.server.stop()
         if self.tray:
             self.tray.stop()
+        try:
+            if self.lock_sock:
+                self.lock_sock.close()
+        except OSError:
+            pass
         self.root.destroy()
 
 
 if __name__ == "__main__":
+    lock = acquire_single_instance()
+    if lock is None:
+        raise SystemExit(0)  # já está aberto: a janela existente foi trazida à frente
     root = tk.Tk()
-    App(root)
+    App(root, lock)
     root.mainloop()
