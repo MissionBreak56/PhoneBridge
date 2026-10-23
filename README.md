@@ -17,6 +17,8 @@ Projeto novo, escrito do zero (não usa código nem o patch do APK analisado). S
 4. Escolha o dispositivo de saída (para microfone, "CABLE Input") e clique em **Iniciar servidor**.
 5. Anote o IP do PC mostrado na janela. Libere o Python no Firewall do Windows (rede privada) quando pedir.
 
+O app detecta o VB-Cable sozinho, seleciona "CABLE Input" e tem botões para baixar o instalador, atualizar a lista de dispositivos e abrir as configurações de som. Após instalar o VB-Cable, reinicie o Windows e clique em "Atualizar dispositivos".
+
 ## Android
 
 1. Abra a pasta `android` no Android Studio e deixe sincronizar o Gradle.

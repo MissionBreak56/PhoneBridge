@@ -10,11 +10,13 @@ Protocolo (TCP, porta padrão 5800):
   PC -> celular : 1 byte status (0 = ok), 4 bytes taxa (big endian), 1 byte canais
   depois: PCM 16 bits little-endian cru, sem enquadramento.
 """
+import os
 import queue
 import socket
 import struct
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import ttk
 
 import numpy as np
@@ -24,6 +26,7 @@ MAGIC = b"PAB1"
 MODE_MIC = 1
 MODE_SPEAKER = 2
 DEFAULT_PORT = 5800
+VBCABLE_URL = "https://vb-audio.com/Cable/"
 
 
 def recv_exact(conn, n):
@@ -215,10 +218,11 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("PhoneBridge")
-        root.geometry("520x380")
+        root.geometry("640x470")
         self.server = None
+        self.has_cable = False
         self.log_q = queue.Queue()
-        self.devices = list_output_devices()
+        self.devices = []
 
         frm = ttk.Frame(root, padding=12)
         frm.pack(fill="both", expand=True)
@@ -230,20 +234,21 @@ class App:
         ttk.Label(frm, text="Saída para o microfone\n(ex.: CABLE Input):").grid(
             row=1, column=0, sticky="w", pady=6
         )
-        names = [n for _, n in self.devices]
         self.dev_var = tk.StringVar()
-        self.combo = ttk.Combobox(frm, textvariable=self.dev_var, values=names, state="readonly", width=48)
+        self.combo = ttk.Combobox(frm, textvariable=self.dev_var, state="readonly", width=48)
         self.combo.grid(row=1, column=1, sticky="we")
-        for n in names:
-            if "CABLE Input" in n:
-                self.dev_var.set(n)
-                break
-        else:
-            if names:
-                self.dev_var.set(names[0])
+
+        self.cable_lbl = ttk.Label(frm, text="")
+        self.cable_lbl.grid(row=5, column=0, columnspan=2, sticky="w")
+        tools = ttk.Frame(frm)
+        tools.grid(row=6, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Button(tools, text="Baixar VB-Cable", command=lambda: webbrowser.open(VBCABLE_URL)).pack(side="left")
+        ttk.Button(tools, text="Atualizar dispositivos", command=self.refresh_devices).pack(side="left", padx=6)
+        ttk.Button(tools, text="Abrir configurações de som", command=self.open_sound).pack(side="left")
 
         self.btn = ttk.Button(frm, text="Iniciar servidor", command=self.toggle)
         self.btn.grid(row=2, column=0, columnspan=2, pady=8)
+        self.refresh_devices()
 
         try:
             ips = socket.gethostbyname_ex(socket.gethostname())[2]
@@ -257,6 +262,31 @@ class App:
         frm.columnconfigure(1, weight=1)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll()
+
+    def refresh_devices(self):
+        self.devices = list_output_devices()
+        names = [n for _, n in self.devices]
+        self.combo["values"] = names
+        cable = next((n for n in names if "CABLE Input" in n), None)
+        if cable:
+            self.dev_var.set(cable)
+            self.cable_lbl.config(
+                text='VB-Cable detectado. Nos apps (Discord, Zoom...) escolha "CABLE Output" como microfone.'
+            )
+        else:
+            if names and self.dev_var.get() not in names:
+                self.dev_var.set(names[0])
+            self.cable_lbl.config(
+                text="VB-Cable não encontrado. Necessário só para usar o celular como microfone "
+                "(instale, reinicie o Windows e clique em Atualizar)."
+            )
+        self.has_cable = cable is not None
+
+    def open_sound(self):
+        try:
+            os.startfile("ms-settings:sound")  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            self.log("Não foi possível abrir as configurações de som")
 
     def log(self, msg):
         self.log_q.put(msg)
@@ -287,6 +317,9 @@ class App:
         try:
             self.server = BridgeServer(port, idx, self.log)
             self.server.start()
+            if not self.has_cable:
+                self.log("Aviso: sem VB-Cable, o modo microfone toca só na saída escolhida; "
+                         "outros apps não o verão como microfone. O modo alto-falante funciona normalmente.")
             self.btn.config(text="Parar servidor")
         except OSError as e:
             self.server = None
