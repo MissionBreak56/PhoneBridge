@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
@@ -41,3 +42,29 @@ jobs:
         with:
           name: PhoneBridge-pc-exe
           path: pc/dist/PhoneBridgeServer.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, pc]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mv dist/PhoneBridge-android-apk/*.apk PhoneBridge-android.apk
+          mv dist/PhoneBridge-pc-exe/PhoneBridgeServer.exe PhoneBridgeServer.exe
+          gh release create "${{ github.ref_name }}" PhoneBridge-android.apk PhoneBridgeServer.exe \
+            --repo "${{ github.repository }}" --title "PhoneBridge ${{ github.ref_name }}" --notes-file - <<'NOTES'
+          Use o celular Android como microfone ou alto-falante do PC pelo Wi-Fi.
+
+          - PhoneBridge-android.apk: instale no celular (APK de depuração; permita fontes desconhecidas).
+          - PhoneBridgeServer.exe: servidor para Windows. Para o modo microfone, instale o VB-Cable (https://vb-audio.com/Cable/).
+
+          Sem criptografia nem senha: use só em rede confiável.
+          NOTES
