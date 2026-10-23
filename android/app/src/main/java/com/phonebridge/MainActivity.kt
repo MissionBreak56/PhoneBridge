@@ -1,98 +1,120 @@
 package com.phonebridge
 
 import android.Manifest
-import android.app.Activity
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.text.InputType
-import android.view.Gravity
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
+import android.view.Menu
+import android.view.MenuItem
+import android.view.WindowManager
+import android.widget.SeekBar
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.preference.PreferenceManager
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.TextInputEditText
 import android.widget.TextView
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
-    private lateinit var ipField: EditText
-    private lateinit var portField: EditText
-    private lateinit var modeGroup: RadioGroup
-    private lateinit var button: Button
-    private lateinit var status: TextView
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        val prefs = getSharedPreferences("pb", Context.MODE_PRIVATE)
-        val pad = (16 * resources.displayMetrics.density).toInt()
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad * 2, pad, pad)
+    companion object {
+        fun applyTheme(v: String) {
+            AppCompatDelegate.setDefaultNightMode(
+                when (v) {
+                    "1" -> AppCompatDelegate.MODE_NIGHT_NO
+                    "2" -> AppCompatDelegate.MODE_NIGHT_YES
+                    else -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+                }
+            )
         }
-
-        root.addView(TextView(this).apply {
-            text = "PhoneBridge"
-            textSize = 26f
-        })
-
-        ipField = EditText(this).apply {
-            hint = "IP do PC (ex.: 192.168.0.10)"
-            setText(prefs.getString("ip", ""))
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-        root.addView(ipField)
-
-        portField = EditText(this).apply {
-            hint = "Porta"
-            setText(prefs.getString("port", "5800"))
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(portField)
-
-        modeGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
-            addView(RadioButton(this@MainActivity).apply {
-                text = "Usar o celular como MICROFONE do PC"
-                id = 1
-            })
-            addView(RadioButton(this@MainActivity).apply {
-                text = "Usar o celular como ALTO-FALANTE do PC"
-                id = 2
-            })
-            check(prefs.getInt("mode", 1))
-        }
-        root.addView(modeGroup)
-
-        button = Button(this).apply { setOnClickListener { toggle() } }
-        root.addView(button)
-
-        status = TextView(this).apply {
-            gravity = Gravity.START
-            setPadding(0, pad, 0, 0)
-        }
-        root.addView(status)
-
-        setContentView(root)
-        AudioService.listener = { msg, running ->
-            runOnUiThread {
-                status.text = msg
-                button.text = if (running) "Parar" else "Conectar"
-            }
-        }
-        refresh()
     }
 
-    private fun refresh() {
-        button.text = if (AudioService.running) "Parar" else "Conectar"
-        status.text = AudioService.lastStatus
+    private lateinit var stateText: TextView
+    private lateinit var mainButton: MaterialButton
+    private lateinit var modeGroup: MaterialButtonToggleGroup
+    private lateinit var ipField: TextInputEditText
+    private lateinit var muteSwitch: MaterialSwitch
+    private lateinit var levelText: TextView
+    private lateinit var levelSeek: SeekBar
+
+    private val prefs by lazy { PreferenceManager.getDefaultSharedPreferences(this) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        applyTheme(prefs.getString("theme", "0") ?: "0")
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        stateText = findViewById(R.id.stateText)
+        mainButton = findViewById(R.id.mainButton)
+        modeGroup = findViewById(R.id.modeGroup)
+        ipField = findViewById(R.id.ipField)
+        muteSwitch = findViewById(R.id.muteSwitch)
+        levelText = findViewById(R.id.levelText)
+        levelSeek = findViewById(R.id.levelSeek)
+
+        ipField.setText(prefs.getString("ip", ""))
+        modeGroup.check(if (prefs.getInt("mode", 1) == 2) R.id.modeSpeaker else R.id.modeMic)
+        levelSeek.progress = prefs.getInt("level", 4)
+        AudioService.level = levelSeek.progress
+        updateLevelText()
+
+        mainButton.setOnClickListener { toggle() }
+        modeGroup.addOnButtonCheckedListener { _, _, _ -> updateLevelText() }
+        muteSwitch.setOnCheckedChangeListener { _, checked -> AudioService.muted = checked }
+        levelSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                AudioService.level = p
+                prefs.edit().putInt("level", p).apply()
+                updateLevelText()
+            }
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) {}
+        })
+        muteSwitch.isChecked = AudioService.muted
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AudioService.listener = { render() }
+        render()
+    }
+
+    override fun onStop() {
+        AudioService.listener = null
+        super.onStop()
+    }
+
+    private fun currentMode() = if (modeGroup.checkedButtonId == R.id.modeSpeaker) 2 else 1
+
+    private fun updateLevelText() {
+        val res = if (currentMode() == 1) R.string.gain else R.string.volume
+        levelText.text = getString(res, levelSeek.progress)
+    }
+
+    private fun render() = runOnUiThread {
+        val state = AudioService.state
+        stateText.text = when (state) {
+            AudioService.STATE_CONNECTED -> getString(R.string.state_connected)
+            AudioService.STATE_STARTING -> getString(R.string.state_starting)
+            else -> AudioService.errorMessage ?: getString(R.string.state_stopped)
+        }
+        mainButton.text = getString(if (state == AudioService.STATE_STOPPED) R.string.start else R.string.stop)
+        modeGroup.isEnabled = state == AudioService.STATE_STOPPED
+        findViewById<android.view.View>(R.id.modeMic).isEnabled = state == AudioService.STATE_STOPPED
+        findViewById<android.view.View>(R.id.modeSpeaker).isEnabled = state == AudioService.STATE_STOPPED
+        ipField.isEnabled = state == AudioService.STATE_STOPPED
+        if (state != AudioService.STATE_STOPPED && prefs.getBoolean("screenOn", false)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     private fun toggle() {
-        if (AudioService.running) {
+        if (AudioService.state != AudioService.STATE_STOPPED) {
             startService(Intent(this, AudioService::class.java).setAction(AudioService.ACTION_STOP))
             return
         }
@@ -117,28 +139,38 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             start()
         } else {
-            status.text = "Permissão de microfone negada."
+            AudioService.setError(getString(R.string.perm_denied))
         }
     }
 
     private fun start() {
         val ip = ipField.text.toString().trim()
-        val port = portField.text.toString().toIntOrNull() ?: 5800
-        val mode = if (modeGroup.checkedRadioButtonId == 2) 2 else 1
         if (ip.isEmpty()) {
-            status.text = "Informe o IP do PC."
+            AudioService.setError(getString(R.string.enter_ip))
             return
         }
-        getSharedPreferences("pb", Context.MODE_PRIVATE).edit()
-            .putString("ip", ip).putString("port", port.toString()).putInt("mode", mode).apply()
+        val port = prefs.getString("port", "5800")?.toIntOrNull() ?: 5800
+        val mode = currentMode()
+        val source = prefs.getString("audioSource", "0")?.toIntOrNull() ?: 0
+        prefs.edit().putString("ip", ip).putInt("mode", mode).apply()
         val i = Intent(this, AudioService::class.java)
             .setAction(AudioService.ACTION_START)
             .putExtra("ip", ip).putExtra("port", port).putExtra("mode", mode)
+            .putExtra("source", source)
+            .putExtra("autoMute", prefs.getBoolean("autoMute", false))
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
     }
 
-    override fun onDestroy() {
-        AudioService.listener = null
-        super.onDestroy()
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId == R.id.action_settings) {
+            startActivity(Intent(this, SettingsActivity::class.java))
+            return true
+        }
+        return super.onOptionsItemSelected(item)
     }
 }

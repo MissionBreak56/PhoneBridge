@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:app="http://schemas.android.com/apk/res-auto">
+    <EditTextPreference
+        app:defaultValue="5800"
+        app:key="port"
+        app:title="@string/pref_port"
+        app:useSimpleSummaryProvider="true" />
+    <ListPreference
+        app:defaultValue="0"
+        app:entries="@array/audio_source_entries"
+        app:entryValues="@array/audio_source_values"
+        app:key="audioSource"
+        app:title="@string/pref_audio_source"
+        app:useSimpleSummaryProvider="true" />
+    <SwitchPreferenceCompat
+        app:defaultValue="false"
+        app:key="autoMute"
+        app:summary="@string/pref_auto_mute_summary"
+        app:title="@string/pref_auto_mute" />
+    <SwitchPreferenceCompat
+        app:defaultValue="false"
+        app:key="screenOn"
+        app:summary="@string/pref_screen_on_summary"
+        app:title="@string/pref_screen_on" />
+    <ListPreference
+        app:defaultValue="0"
+        app:entries="@array/theme_entries"
+        app:entryValues="@array/theme_values"
+        app:key="theme"
+        app:title="@string/pref_theme"
+        app:useSimpleSummaryProvider="true" />
+    <Preference
+        app:key="about"
+        app:selectable="false"
+        app:summary="@string/about_summary"
+        app:title="@string/pref_about" />
+</PreferenceScreen>

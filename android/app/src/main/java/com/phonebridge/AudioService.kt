@@ -35,14 +35,24 @@ class AudioService : Service() {
         private const val CHANNEL = "pb"
         private const val NOTIF_ID = 1
 
-        @Volatile var running = false
-        @Volatile var lastStatus = "Desconectado."
-        @Volatile var listener: ((String, Boolean) -> Unit)? = null
+        const val STATE_STOPPED = 0
+        const val STATE_STARTING = 1
+        const val STATE_CONNECTED = 2
 
-        fun report(msg: String, isRunning: Boolean = running) {
-            lastStatus = msg
-            listener?.invoke(msg, isRunning)
+        @Volatile var running = false
+        @Volatile var state = STATE_STOPPED
+        @Volatile var errorMessage: String? = null
+        @Volatile var muted = false
+        @Volatile var level = 4
+        @Volatile var listener: (() -> Unit)? = null
+
+        fun setState(s: Int, error: String? = null) {
+            state = s
+            errorMessage = error
+            listener?.invoke()
         }
+
+        fun setError(msg: String) = setState(STATE_STOPPED, msg)
     }
 
     private var worker: Thread? = null
@@ -54,7 +64,9 @@ class AudioService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            val wasRunning = running
             stopAll()
+            if (!wasRunning) stopSelf()
             return START_NOT_STICKY
         }
         if (running) return START_NOT_STICKY
@@ -62,22 +74,25 @@ class AudioService : Service() {
         val ip = intent?.getStringExtra("ip") ?: return START_NOT_STICKY
         val port = intent.getIntExtra("port", 5800)
         val mode = intent.getIntExtra("mode", 1)
+        val source = intent.getIntExtra("source", 0)
+        autoMute = intent.getBooleanExtra("autoMute", false)
+        errorMessage = null
 
         startForegroundCompat(mode)
         running = true
         acquireLocks()
-        report("Conectando a $ip:$port ...", true)
+        setState(STATE_STARTING)
 
         worker = Thread {
             try {
-                if (mode == 1) runMic(ip, port) else runSpeaker(ip, port)
+                if (mode == 1) runMic(ip, port, source) else runSpeaker(ip, port)
             } catch (e: Exception) {
-                if (running) report("Erro: ${e.message}", false)
+                if (running) errorMessage = e.message ?: e.javaClass.simpleName
             } finally {
                 running = false
                 try { socket?.close() } catch (_: Exception) {}
                 releaseLocks()
-                report(if (lastStatus.startsWith("Erro")) lastStatus else "Desconectado.", false)
+                setState(STATE_STOPPED, errorMessage)
                 stopForegroundCompat()
                 stopSelf()
             }
@@ -103,16 +118,16 @@ class AudioService : Service() {
     }
 
     // celular -> PC
-    private fun runMic(ip: String, port: Int) {
+    private fun runMic(ip: String, port: Int, source: Int) {
         val (s, rate, _) = connect(ip, port, 1)
         val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val frame = rate / 100 * 2 // 10 ms em bytes
         val rec = AudioRecord(
-            MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO,
+            source, rate, AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, frame * 4)
         )
         if (rec.state != AudioRecord.STATE_INITIALIZED) throw RuntimeException("não foi possível abrir o microfone")
-        report("Microfone ativo (${rate} Hz).", true)
+        setState(STATE_CONNECTED)
         val out = s.getOutputStream()
         val buf = ByteArray(frame)
         try {
@@ -123,6 +138,11 @@ class AudioService : Service() {
                     val n = rec.read(buf, off, frame - off)
                     if (n < 0) throw RuntimeException("falha na captura")
                     off += n
+                }
+                if (isMuted()) {
+                    java.util.Arrays.fill(buf, 0, frame, 0)
+                } else {
+                    applyGain(buf, frame, (level + 1) / 5f)
                 }
                 out.write(buf, 0, frame)
             }
@@ -150,12 +170,13 @@ class AudioService : Service() {
             .setBufferSizeInBytes(maxOf(minBuf, frame * 6))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-        report("Alto-falante ativo (${rate} Hz).", true)
+        setState(STATE_CONNECTED)
         val inp: InputStream = s.getInputStream()
         val buf = ByteArray(frame)
         try {
             track.play()
             while (running) {
+                track.setVolume(if (isMuted()) 0f else (level + 1) / 10f)
                 var off = 0
                 while (off < frame) {
                     val n = inp.read(buf, off, frame - off)
@@ -169,6 +190,28 @@ class AudioService : Service() {
         }
     }
 
+    private var autoMute = false
+
+    private fun isMuted(): Boolean {
+        if (muted) return true
+        if (!autoMute) return false
+        val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+        return am.mode == android.media.AudioManager.MODE_IN_CALL ||
+            am.mode == android.media.AudioManager.MODE_RINGTONE
+    }
+
+    private fun applyGain(buf: ByteArray, len: Int, gain: Float) {
+        if (gain == 1f) return
+        var i = 0
+        while (i + 1 < len) {
+            val v = ((buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)).toShort().toInt()
+            val g = (v * gain).toInt().coerceIn(-32768, 32767)
+            buf[i] = (g and 0xFF).toByte()
+            buf[i + 1] = ((g shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+
     private fun stopAll() {
         running = false
         try { socket?.close() } catch (_: Exception) {}
@@ -179,13 +222,13 @@ class AudioService : Service() {
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(NotificationChannel(CHANNEL, "PhoneBridge", NotificationManager.IMPORTANCE_LOW))
         }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        val open = PendingIntent.getService(
+            this, 0, Intent(this, AudioService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
         )
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
-        return b.setContentTitle("PhoneBridge")
-            .setContentText("Transmitindo áudio com o PC")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+        return b.setContentTitle(getString(R.string.app_name))
+            .setContentText(getString(R.string.notif_streaming))
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(open)
             .setOngoing(true)
             .build()

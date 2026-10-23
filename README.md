@@ -33,3 +33,7 @@ PC e celular precisam estar na mesma rede Wi-Fi (ou use USB tethering).
 - Sem compressão, sem criptografia e sem autenticação: use só em rede de confiança.
 - Uma conexão de cada vez por modo; sem descoberta automática (digite o IP).
 - Latência típica de 30 a 100 ms em Wi-Fi bom.
+
+## Interface do app Android (v1.1)
+
+Visual em Material 3, tela única centralizada: estado (Parado / Iniciando / Conectado), seletor Microfone/Alto-falante, IP do PC, botão Iniciar/Parar, interruptor Silenciar e controle de volume (ganho do microfone no modo microfone). Menu > Configurações: porta, fonte de áudio, silenciar em chamadas, manter tela ligada, tema e sobre.
