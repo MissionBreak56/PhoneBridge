@@ -10,6 +10,7 @@ Protocolo (TCP, porta padrão 5800):
   PC -> celular : 1 byte status (0 = ok), 4 bytes taxa (big endian), 1 byte canais
   depois: PCM 16 bits little-endian cru, sem enquadramento.
 """
+import json
 import os
 import queue
 import socket
@@ -21,6 +22,8 @@ from tkinter import ttk
 
 import numpy as np
 import pyaudiowpatch as pyaudio
+import pystray
+from PIL import Image, ImageDraw, ImageTk
 
 MAGIC = b"PAB1"
 MODE_MIC = 1
@@ -65,6 +68,8 @@ class BridgeServer:
         self.running = False
         self.sock = None
         self.conns = set()
+        self.clients = {}  # conn -> (ip, modo)
+        self.muted = False
         self.lock = threading.Lock()
 
     def start(self):
@@ -86,6 +91,7 @@ class BridgeServer:
                 except OSError:
                     pass
             self.conns.clear()
+            self.clients.clear()
         if self.sock:
             try:
                 self.sock.close()
@@ -113,6 +119,8 @@ class BridgeServer:
             if hdr[:4] != MAGIC:
                 raise ValueError("handshake inválido")
             mode = hdr[4]
+            with self.lock:
+                self.clients[conn] = (addr[0], mode)
             if mode == MODE_MIC:
                 self._mic(conn)
             elif mode == MODE_SPEAKER:
@@ -129,6 +137,7 @@ class BridgeServer:
                 pass
             with self.lock:
                 self.conns.discard(conn)
+                self.clients.pop(conn, None)
             self.log(f"Desconectado: {addr[0]}")
 
     # celular -> PC
@@ -155,6 +164,8 @@ class BridgeServer:
             chunk = rate // 100 * 2
             while self.running:
                 data = recv_exact(conn, chunk)
+                if self.muted:
+                    data = bytes(len(data))  # silêncio, mantém o ritmo do stream
                 if out_ch == 2:
                     data = np.repeat(np.frombuffer(data, dtype=np.int16), 2).tobytes()
                 stream.write(data)
@@ -214,53 +225,148 @@ class BridgeServer:
             p.terminate()
 
 
+# ---------------------------------------------------------------- interface
+BG = "#0f1115"
+SURFACE = "#181b21"
+BORDER = "#262a33"
+TEXT = "#e6e8ec"
+MUTED_TXT = "#8b919c"
+ACCENT = "#4f8cff"
+ACCENT_HOVER = "#6b9fff"
+DANGER = "#ef5350"
+OK = "#3ddc84"
+FONT = "Segoe UI"
+
+CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PhoneBridge", "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+    except OSError:
+        pass
+
+
+def make_icon(size=64, muted=False):
+    """Ícone minimalista: quadrado escuro arredondado com um microfone."""
+    s = size * 4
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, s - 1, s - 1), radius=s // 4, fill=(24, 27, 33, 255))
+    col = (239, 83, 80, 255) if muted else (79, 140, 255, 255)
+    w = s // 14
+    d.rounded_rectangle((s * 0.38, s * 0.16, s * 0.62, s * 0.56), radius=s * 0.12, fill=col)
+    d.arc((s * 0.27, s * 0.30, s * 0.73, s * 0.72), 0, 180, fill=col, width=w)
+    d.line((s * 0.5, s * 0.72, s * 0.5, s * 0.84), fill=col, width=w)
+    d.line((s * 0.38, s * 0.84, s * 0.62, s * 0.84), fill=col, width=w)
+    if muted:
+        d.line((s * 0.2, s * 0.2, s * 0.8, s * 0.8), fill=(255, 255, 255, 255), width=w)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+class FlatButton(tk.Label):
+    def __init__(self, master, text, command, bg=ACCENT, hover=ACCENT_HOVER, fg="#ffffff"):
+        super().__init__(master, text=text, bg=bg, fg=fg, font=(FONT, 11, "bold"),
+                         cursor="hand2", pady=10)
+        self.command, self.base, self.hover = command, bg, hover
+        self.bind("<Button-1>", lambda e: self.command())
+        self.bind("<Enter>", lambda e: super(FlatButton, self).config(bg=self.hover))
+        self.bind("<Leave>", lambda e: super(FlatButton, self).config(bg=self.base))
+
+    def set(self, text, bg, hover, fg="#ffffff"):
+        self.base, self.hover = bg, hover
+        super().config(text=text, bg=bg, fg=fg)
+
+
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("PhoneBridge")
-        root.geometry("640x470")
+        self.cfg = load_config()
         self.server = None
-        self.has_cable = False
+        self.muted = False
         self.log_q = queue.Queue()
+        self.ui_q = queue.Queue()
         self.devices = []
+        self.has_cable = False
+        self.tray = None
+        self.hint_shown = False
 
-        frm = ttk.Frame(root, padding=12)
-        frm.pack(fill="both", expand=True)
+        root.title("PhoneBridge")
+        root.geometry("440x720")
+        root.minsize(400, 640)
+        root.configure(bg=BG)
+        self.win_icon = ImageTk.PhotoImage(make_icon(64))
+        root.iconphoto(True, self.win_icon)
+        self._style()
 
-        ttk.Label(frm, text="Porta:").grid(row=0, column=0, sticky="w")
-        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        ttk.Entry(frm, textvariable=self.port_var, width=8).grid(row=0, column=1, sticky="w")
+        pad = 20
+        wrap = tk.Frame(root, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=pad, pady=(pad, 12))
 
-        ttk.Label(frm, text="Saída para o microfone\n(ex.: CABLE Input):").grid(
-            row=1, column=0, sticky="w", pady=6
-        )
+        tk.Label(wrap, text="PhoneBridge", bg=BG, fg=TEXT, font=(FONT, 22, "bold")).pack(anchor="w")
+        row = tk.Frame(wrap, bg=BG)
+        row.pack(anchor="w", pady=(2, 16))
+        self.dot = tk.Canvas(row, width=10, height=10, bg=BG, highlightthickness=0)
+        self.dot.pack(side="left", padx=(0, 8))
+        self.dot_id = self.dot.create_oval(1, 1, 9, 9, fill=MUTED_TXT, outline="")
+        self.status = tk.Label(row, text="Servidor parado", bg=BG, fg=MUTED_TXT, font=(FONT, 10))
+        self.status.pack(side="left")
+
+        self._label(wrap, "PORTA")
+        self.port_var = tk.StringVar(value=str(self.cfg.get("port", DEFAULT_PORT)))
+        ttk.Entry(wrap, textvariable=self.port_var, style="D.TEntry").pack(fill="x", pady=(4, 12), ipady=4)
+
+        self._label(wrap, "SAÍDA DO MICROFONE (EX.: CABLE INPUT)")
         self.dev_var = tk.StringVar()
-        self.combo = ttk.Combobox(frm, textvariable=self.dev_var, state="readonly", width=48)
-        self.combo.grid(row=1, column=1, sticky="we")
-
-        self.cable_lbl = ttk.Label(frm, text="")
-        self.cable_lbl.grid(row=5, column=0, columnspan=2, sticky="w")
-        tools = ttk.Frame(frm)
-        tools.grid(row=6, column=0, columnspan=2, sticky="w", pady=4)
-        ttk.Button(tools, text="Baixar VB-Cable", command=lambda: webbrowser.open(VBCABLE_URL)).pack(side="left")
-        ttk.Button(tools, text="Atualizar dispositivos", command=self.refresh_devices).pack(side="left", padx=6)
-        ttk.Button(tools, text="Abrir configurações de som", command=self.open_sound).pack(side="left")
-
-        self.btn = ttk.Button(frm, text="Iniciar servidor", command=self.toggle)
-        self.btn.grid(row=2, column=0, columnspan=2, pady=8)
+        self.combo = ttk.Combobox(wrap, textvariable=self.dev_var, state="readonly", style="D.TCombobox")
+        self.combo.pack(fill="x", pady=(4, 6), ipady=4)
+        self.cable_lbl = tk.Label(wrap, text="", bg=BG, fg=MUTED_TXT, font=(FONT, 9),
+                                  justify="left", wraplength=390)
+        self.cable_lbl.pack(anchor="w")
+        tools = tk.Frame(wrap, bg=BG)
+        tools.pack(anchor="w", pady=(6, 12))
+        for txt, cmd in (("Baixar VB-Cable", lambda: webbrowser.open(VBCABLE_URL)),
+                         ("Atualizar", self.refresh_devices),
+                         ("Config. de som", self.open_sound)):
+            b = FlatButton(tools, txt, cmd, bg=SURFACE, hover=BORDER, fg=TEXT)
+            b.config(font=(FONT, 9), pady=5, padx=10)
+            b.pack(side="left", padx=(0, 6))
         self.refresh_devices()
 
         try:
-            ips = socket.gethostbyname_ex(socket.gethostname())[2]
+            ips = [i for i in socket.gethostbyname_ex(socket.gethostname())[2] if not i.startswith("127.")]
         except OSError:
             ips = []
-        ttk.Label(frm, text="IP(s) deste PC: " + ", ".join(ips)).grid(row=3, column=0, columnspan=2, sticky="w")
+        self._label(wrap, "IP DESTE PC")
+        tk.Label(wrap, text="   ".join(ips) or "indisponível", bg=BG, fg=TEXT,
+                 font=(FONT, 11), justify="left", wraplength=360).pack(anchor="w", pady=(4, 16))
 
-        self.logbox = tk.Text(frm, height=10, state="disabled")
-        self.logbox.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=6)
-        frm.rowconfigure(4, weight=1)
-        frm.columnconfigure(1, weight=1)
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.btn = FlatButton(wrap, "Iniciar servidor", self.toggle)
+        self.btn.pack(fill="x")
+        self.mute_btn = FlatButton(wrap, "Silenciar microfone", self.toggle_mute,
+                                   bg=SURFACE, hover=BORDER, fg=TEXT)
+        self.mute_btn.pack(fill="x", pady=(10, 16))
+
+        self._label(wrap, "REGISTRO")
+        box = tk.Frame(wrap, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        box.pack(fill="both", expand=True, pady=(4, 0))
+        self.logbox = tk.Text(box, height=6, bg=SURFACE, fg=MUTED_TXT, relief="flat", bd=0,
+                              font=("Consolas", 9), state="disabled", wrap="word",
+                              padx=8, pady=6, insertbackground=TEXT)
+        self.logbox.pack(fill="both", expand=True)
+
+        root.protocol("WM_DELETE_WINDOW", self.hide)
+        self._start_tray()
         self.poll()
 
     def refresh_devices(self):
@@ -268,19 +374,15 @@ class App:
         names = [n for _, n in self.devices]
         self.combo["values"] = names
         cable = next((n for n in names if "CABLE Input" in n), None)
-        if cable:
-            self.dev_var.set(cable)
-            self.cable_lbl.config(
-                text='VB-Cable detectado. Nos apps (Discord, Zoom...) escolha "CABLE Output" como microfone.'
-            )
-        else:
-            if names and self.dev_var.get() not in names:
-                self.dev_var.set(names[0])
-            self.cable_lbl.config(
-                text="VB-Cable não encontrado. Necessário só para usar o celular como microfone "
-                "(instale, reinicie o Windows e clique em Atualizar)."
-            )
+        if self.dev_var.get() not in names:
+            saved = self.cfg.get("device")
+            self.dev_var.set(saved if saved in names else (cable or (names[0] if names else "")))
         self.has_cable = cable is not None
+        if cable:
+            self.cable_lbl.config(text='VB-Cable detectado. Nos apps (Discord, Zoom...) escolha "CABLE Output" como microfone.')
+        else:
+            self.cable_lbl.config(text="VB-Cable não encontrado. Necessário só para usar o celular como microfone "
+                                       "(instale, reinicie o Windows e clique em Atualizar).")
 
     def open_sound(self):
         try:
@@ -288,6 +390,53 @@ class App:
         except Exception:  # noqa: BLE001
             self.log("Não foi possível abrir as configurações de som")
 
+    # ---- helpers de estilo
+    def _style(self):
+        st = ttk.Style(self.root)
+        st.theme_use("clam")
+        st.configure("D.TEntry", fieldbackground=SURFACE, foreground=TEXT, bordercolor=BORDER,
+                     lightcolor=BORDER, darkcolor=BORDER, insertcolor=TEXT, padding=4)
+        st.configure("D.TCombobox", fieldbackground=SURFACE, background=SURFACE, foreground=TEXT,
+                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, arrowcolor=MUTED_TXT,
+                     selectbackground=SURFACE, selectforeground=TEXT, padding=4)
+        st.map("D.TCombobox", fieldbackground=[("readonly", SURFACE)], foreground=[("readonly", TEXT)])
+        self.root.option_add("*TCombobox*Listbox.background", SURFACE)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+    def _label(self, parent, text):
+        tk.Label(parent, text=text, bg=BG, fg=MUTED_TXT, font=(FONT, 8, "bold")).pack(anchor="w")
+
+    # ---- bandeja
+    def _start_tray(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir PhoneBridge", lambda: self.ui_q.put("show"), default=True),
+            pystray.MenuItem(lambda item: "Reativar microfone" if self.muted else "Silenciar microfone",
+                             lambda: self.ui_q.put("mute")),
+            pystray.MenuItem(lambda item: "Parar servidor" if self.server else "Iniciar servidor",
+                             lambda: self.ui_q.put("toggle")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Sair", lambda: self.ui_q.put("quit")),
+        )
+        self.tray = pystray.Icon("PhoneBridge", make_icon(64), "PhoneBridge", menu)
+        self.tray.run_detached()
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide(self):
+        self.root.withdraw()
+        if not self.hint_shown and self.tray:
+            self.hint_shown = True
+            try:
+                self.tray.notify("Continua em execução na bandeja do sistema.", "PhoneBridge")
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- ações
     def log(self, msg):
         self.log_q.put(msg)
 
@@ -297,37 +446,82 @@ class App:
             self.logbox.insert("end", self.log_q.get() + "\n")
             self.logbox.see("end")
             self.logbox.config(state="disabled")
+        while not self.ui_q.empty():
+            act = self.ui_q.get()
+            if act == "show":
+                self.show()
+            elif act == "mute":
+                self.toggle_mute()
+            elif act == "toggle":
+                self.toggle()
+            elif act == "quit":
+                self.quit()
+                return
+        self.update_status()
         self.root.after(200, self.poll)
+
+    def update_status(self):
+        if not self.server:
+            text, col = "Servidor parado", MUTED_TXT
+        else:
+            with self.server.lock:
+                clients = list(self.server.clients.values())
+            if clients:
+                ips = ", ".join(sorted({ip for ip, _ in clients}))
+                text, col = f"Conectado: {ips}", OK
+            else:
+                text, col = f"Aguardando conexão na porta {self.server.port}", ACCENT
+        self.status.config(text=text)
+        self.dot.itemconfig(self.dot_id, fill=col)
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.server:
+            self.server.muted = self.muted
+        if self.muted:
+            self.mute_btn.set("Microfone silenciado", DANGER, "#f4726f")
+        else:
+            self.mute_btn.set("Silenciar microfone", SURFACE, BORDER, TEXT)
+        if self.tray:
+            self.tray.icon = make_icon(64, self.muted)
+            self.tray.update_menu()
+        self.log("Microfone silenciado" if self.muted else "Microfone reativado")
 
     def toggle(self):
         if self.server:
             self.server.stop()
             self.server = None
-            self.btn.config(text="Iniciar servidor")
+            self.btn.set("Iniciar servidor", ACCENT, ACCENT_HOVER)
+            if self.tray:
+                self.tray.update_menu()
             return
         try:
             port = int(self.port_var.get())
         except ValueError:
             self.log("Porta inválida")
             return
-        idx = None
-        for i, n in self.devices:
-            if n == self.dev_var.get():
-                idx = i
+        idx = next((i for i, n in self.devices if n == self.dev_var.get()), None)
         try:
             self.server = BridgeServer(port, idx, self.log)
+            self.server.muted = self.muted
             self.server.start()
             if not self.has_cable:
                 self.log("Aviso: sem VB-Cable, o modo microfone toca só na saída escolhida; "
                          "outros apps não o verão como microfone. O modo alto-falante funciona normalmente.")
-            self.btn.config(text="Parar servidor")
+            self.btn.set("Parar servidor", SURFACE, BORDER, TEXT)
+            self.cfg.update(port=port, device=self.dev_var.get())
+            save_config(self.cfg)
         except OSError as e:
             self.server = None
             self.log(f"Não foi possível abrir a porta: {e}")
+        if self.tray:
+            self.tray.update_menu()
 
-    def close(self):
+    def quit(self):
         if self.server:
             self.server.stop()
+        if self.tray:
+            self.tray.stop()
         self.root.destroy()
 
 

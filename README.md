@@ -37,3 +37,10 @@ PC e celular precisam estar na mesma rede Wi-Fi (ou use USB tethering).
 ## Interface do app Android (v1.1)
 
 Visual em Material 3, tela única centralizada: estado (Parado / Iniciando / Conectado), seletor Microfone/Alto-falante, IP do PC, botão Iniciar/Parar, interruptor Silenciar e controle de volume (ganho do microfone no modo microfone). Menu > Configurações: porta, fonte de áudio, silenciar em chamadas, manter tela ligada, tema e sobre.
+
+## Interface do PC (v1.2)
+
+- Visual escuro minimalista, no mesmo estilo do app Android.
+- Ao fechar a janela, o app continua em segundo plano na bandeja do sistema; clique no ícone para reabrir ou use **Sair** no menu da bandeja para encerrar.
+- Botão **Silenciar microfone** (também no menu da bandeja): o PC passa a receber silêncio do celular sem derrubar a conexão.
+- Porta e dispositivo de saída escolhidos ficam salvos entre execuções.

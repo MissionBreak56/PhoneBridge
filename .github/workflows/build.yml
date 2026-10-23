@@ -40,7 +40,7 @@ jobs:
         working-directory: pc
         run: |
           pip install -r requirements.txt pyinstaller
-          pyinstaller --onefile --noconsole --name PhoneBridgeServer server.py
+          pyinstaller --onefile --noconsole --icon icon.ico --name PhoneBridgeServer --hidden-import pystray._win32 server.py
       - uses: actions/upload-artifact@v4
         with:
           name: PhoneBridge-pc-exe
@@ -67,7 +67,7 @@ jobs:
           Use o celular Android como microfone ou alto-falante do PC pelo Wi-Fi.
 
           - PhoneBridge-android.apk: instale no celular (APK de depuração; permita fontes desconhecidas).
-          - PhoneBridgeServer.exe: servidor para Windows. Para o modo microfone, instale o VB-Cable (https://vb-audio.com/Cable/).
+          - PhoneBridgeServer.exe: servidor para Windows (interface escura, fica na bandeja ao fechar a janela, botão de silenciar microfone). Para o modo microfone, instale o VB-Cable (https://vb-audio.com/Cable/).
 
           Sem criptografia nem senha: use só em rede confiável.
           NOTES
