@@ -103,6 +103,8 @@ class AudioService : Service() {
     private fun connect(ip: String, port: Int, mode: Int): Triple<Socket, Int, Int> {
         val s = Socket()
         s.tcpNoDelay = true
+        s.receiveBufferSize = 16384 // buffers pequenos = menos atraso acumulado
+        s.sendBufferSize = 16384
         s.connect(InetSocketAddress(ip, port), 5000)
         socket = s
         val out = s.getOutputStream()
@@ -167,8 +169,9 @@ class AudioService : Service() {
                 AudioFormat.Builder().setSampleRate(rate)
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(chMask).build()
             )
-            .setBufferSizeInBytes(maxOf(minBuf, frame * 6))
+            .setBufferSizeInBytes(maxOf(minBuf, frame * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
+            .apply { if (Build.VERSION.SDK_INT >= 26) setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY) }
             .build()
         setState(STATE_CONNECTED)
         val inp: InputStream = s.getInputStream()
@@ -177,16 +180,23 @@ class AudioService : Service() {
             track.play()
             while (running) {
                 track.setVolume(if (isMuted()) 0f else (level + 1) / 10f)
-                var off = 0
-                while (off < frame) {
-                    val n = inp.read(buf, off, frame - off)
-                    if (n < 0) throw RuntimeException("PC encerrou a conexão")
-                    off += n
-                }
+                // se acumulou mais de ~60 ms, descarta o atraso e fica com ~20 ms
+                val backlog = inp.available() / frame
+                if (backlog > 6) repeat(backlog - 2) { readFrame(inp, buf, frame) }
+                readFrame(inp, buf, frame)
                 track.write(buf, 0, frame)
             }
         } finally {
             track.stop(); track.release()
+        }
+    }
+
+    private fun readFrame(inp: InputStream, buf: ByteArray, frame: Int) {
+        var off = 0
+        while (off < frame) {
+            val n = inp.read(buf, off, frame - off)
+            if (n < 0) throw RuntimeException("PC encerrou a conexão")
+            off += n
         }
     }
 
@@ -254,7 +264,10 @@ class AudioService : Service() {
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pb:audio").apply { acquire() }
         val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         @Suppress("DEPRECATION")
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "pb:wifi").apply { acquire() }
+        wifiLock = wm.createWifiLock(
+            if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "pb:wifi"
+        ).apply { acquire() }
     }
 
     private fun releaseLocks() {

@@ -10,6 +10,7 @@ Protocolo (TCP, porta padrão 5800):
   PC -> celular : 1 byte status (0 = ok), 4 bytes taxa (big endian), 1 byte canais
   depois: PCM 16 bits little-endian cru, sem enquadramento.
 """
+import collections
 import json
 import os
 import queue
@@ -127,6 +128,7 @@ class BridgeServer:
             except OSError:
                 break
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)  # pouco atraso acumulado no TCP
             with self.lock:
                 self.conns.add(conn)
             threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
@@ -181,13 +183,46 @@ class BridgeServer:
             )
             self.log(f"Microfone: {rate} Hz -> {dev['name']}")
             chunk = rate // 100 * 2
+            q = collections.deque()
+            cv = threading.Condition()
+            st = {"dead": False, "err": None}
+
+            def reader():
+                # lê sempre, para o TCP não acumular; guarda no máximo ~60 ms
+                try:
+                    while self.running:
+                        d = recv_exact(conn, chunk)
+                        with cv:
+                            q.append(d)
+                            if len(q) > 6:
+                                while len(q) > 2:
+                                    q.popleft()
+                            cv.notify()
+                except Exception as e:  # noqa: BLE001
+                    st["err"] = e
+                finally:
+                    with cv:
+                        st["dead"] = True
+                        cv.notify()
+
+            threading.Thread(target=reader, daemon=True).start()
+            with cv:  # pré-buffer mínimo (20 ms) contra picos do Wi-Fi
+                while len(q) < 2 and not st["dead"] and self.running:
+                    cv.wait(0.2)
             while self.running:
-                data = recv_exact(conn, chunk)
+                with cv:
+                    while not q and not st["dead"] and self.running:
+                        cv.wait(0.2)
+                    if not q:
+                        break
+                    data = q.popleft()
                 if self.muted:
                     data = bytes(len(data))  # silêncio, mantém o ritmo do stream
                 if out_ch == 2:
                     data = np.repeat(np.frombuffer(data, dtype=np.int16), 2).tobytes()
                 stream.write(data)
+            if st["err"] and self.running:
+                raise st["err"]
         finally:
             if stream:
                 stream.stop_stream()
@@ -208,13 +243,17 @@ class BridgeServer:
             in_ch = int(lb["maxInputChannels"])
             out_ch = 1 if in_ch == 1 else 2
             conn.sendall(struct.pack(">BIB", 0, rate, out_ch))
-            q = queue.Queue(maxsize=50)
+            q = queue.Queue(maxsize=8)  # ~80 ms; descarta o mais antigo
 
             def cb(in_data, frame_count, time_info, status):
                 try:
                     q.put_nowait(in_data)
                 except queue.Full:
-                    pass
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(in_data)
+                    except (queue.Empty, queue.Full):
+                        pass
                 return (None, pyaudio.paContinue)
 
             stream = p.open(
