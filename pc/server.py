@@ -11,15 +11,18 @@ Protocolo (TCP, porta padrão 5800):
   depois: PCM 16 bits little-endian cru, sem enquadramento.
 """
 import collections
+import ctypes
 import json
 import os
 import queue
 import socket
 import struct
+import subprocess
 import threading
+import time
 import tkinter as tk
 import webbrowser
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -315,6 +318,37 @@ def save_config(cfg):
         pass
 
 
+# ---- Firewall do Windows (regra de entrada para a porta do servidor)
+NO_WINDOW = 0x08000000
+
+
+def fw_rule_name(port):
+    return f"PhoneBridge {port}"
+
+
+def fw_rule_exists(port):
+    if os.name != "nt":
+        return True
+    try:
+        r = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={fw_rule_name(port)}"],
+            capture_output=True, creationflags=NO_WINDOW, timeout=10,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True  # não deu para checar: melhor não incomodar
+
+
+def fw_add_rule_elevated(port):
+    """Pede permissão de administrador (UAC) e cria a regra. True se o pedido foi aceito."""
+    params = (f'advfirewall firewall add rule name="{fw_rule_name(port)}" dir=in action=allow '
+              f'protocol=TCP localport={port} remoteip=localsubnet profile=any')
+    try:
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", "netsh", params, None, 0) > 32
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def make_icon(size=64, muted=False):
     """Ícone minimalista: quadrado escuro arredondado com um microfone."""
     s = size * 4
@@ -361,7 +395,9 @@ class App:
         self.hint_shown = False
 
         root.title("PhoneBridge")
-        root.geometry("440x720")
+        self._win_job = None
+        self._fw_busy = False
+        self._restore_window()
         root.minsize(400, 640)
         root.configure(bg=BG)
         self.win_icon = ImageTk.PhotoImage(make_icon(64))
@@ -425,8 +461,10 @@ class App:
         self.logbox.pack(fill="both", expand=True)
 
         root.protocol("WM_DELETE_WINDOW", self.hide)
+        root.bind("<Configure>", self._on_configure)
         self._start_tray()
         self.poll()
+        root.after(1200, lambda: self.check_firewall(self._cur_port()))
         if lock is not None:
             threading.Thread(target=self._listen_show, args=(lock,), daemon=True).start()
 
@@ -490,11 +528,120 @@ class App:
                              lambda: self.ui_q.put("mute")),
             pystray.MenuItem(lambda item: "Parar servidor" if self.server else "Iniciar servidor",
                              lambda: self.ui_q.put("toggle")),
+            pystray.MenuItem("Liberar no Firewall", lambda: self.ui_q.put("firewall")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", lambda: self.ui_q.put("quit")),
         )
         self.tray = pystray.Icon("PhoneBridge", make_icon(64), "PhoneBridge", menu)
         self.tray.run_detached()
+
+    # ---- lembrar posição/tamanho da janela
+    def _virtual_screen(self):
+        try:
+            u = ctypes.windll.user32
+            return u.GetSystemMetrics(76), u.GetSystemMetrics(77), u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+        except Exception:  # noqa: BLE001
+            return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _restore_window(self):
+        geo = "440x720"
+        w = self.cfg.get("window")
+        if isinstance(w, dict):
+            try:
+                vx, vy, vw, vh = self._virtual_screen()
+                ww = max(400, min(int(w["w"]), vw))
+                hh = max(640, min(int(w["h"]), vh))
+                x = max(vx, min(int(w["x"]), vx + vw - ww))  # garante que fique dentro de alguma tela
+                y = max(vy, min(int(w["y"]), vy + vh - hh))
+                geo = f"{ww}x{hh}+{x}+{y}"
+            except (KeyError, TypeError, ValueError):
+                pass
+        self.root.geometry(geo)
+        if self.cfg.get("zoomed"):
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
+
+    def _on_configure(self, e):
+        if e.widget is not self.root:
+            return
+        if self._win_job:
+            self.root.after_cancel(self._win_job)
+        self._win_job = self.root.after(600, self._save_window)
+
+    def _save_window(self):
+        self._win_job = None
+        try:
+            state = self.root.state()
+        except tk.TclError:
+            return
+        if state == "normal":
+            self.cfg["window"] = {"x": self.root.winfo_x(), "y": self.root.winfo_y(),
+                                  "w": self.root.winfo_width(), "h": self.root.winfo_height()}
+            self.cfg["zoomed"] = False
+        elif state == "zoomed":
+            self.cfg["zoomed"] = True
+        else:
+            return
+        save_config(self.cfg)
+
+    # ---- firewall
+    def _cur_port(self):
+        try:
+            return int(self.port_var.get())
+        except ValueError:
+            return DEFAULT_PORT
+
+    def check_firewall(self, port, force=False):
+        if os.name != "nt" or self._fw_busy:
+            return
+        if fw_rule_exists(port):
+            if force:
+                self.log(f"Firewall: a regra para a porta {port} já existe.")
+            return
+        declined = self.cfg.setdefault("fw_declined", [])
+        if port in declined and not force:
+            return
+        ok = messagebox.askyesno(
+            "PhoneBridge - Firewall",
+            f"Para o celular conseguir conectar neste PC mesmo com a rede como \"Pública\", "
+            f"o PhoneBridge pode criar uma regra no Firewall do Windows liberando a porta {port} "
+            f"somente para dispositivos da sua rede local.\n\n"
+            f"O Windows vai pedir permissão de administrador. Criar a regra agora?",
+            parent=self.root,
+        )
+        if not ok:
+            if port not in declined:
+                declined.append(port)
+                save_config(self.cfg)
+            self.log("Firewall: regra não criada. Se o celular não conectar, deixe a rede como Privada "
+                     'ou use o menu da bandeja > "Liberar no Firewall".')
+            return
+        if port in declined:
+            declined.remove(port)
+            save_config(self.cfg)
+        self._fw_busy = True
+        self.log("Firewall: aguardando a permissão de administrador...")
+        threading.Thread(target=self._fw_create, args=(port,), daemon=True).start()
+
+    def _fw_create(self, port):
+        created = False
+        if fw_add_rule_elevated(port):
+            for _ in range(20):
+                time.sleep(0.5)
+                if fw_rule_exists(port):
+                    created = True
+                    break
+        if created:
+            self.log(f"Firewall: porta {port} liberada para a rede local.")
+        else:
+            declined = self.cfg.setdefault("fw_declined", [])
+            if port not in declined:
+                declined.append(port)
+                save_config(self.cfg)
+            self.log("Firewall: não foi possível criar a regra (permissão negada?).")
+        self._fw_busy = False
 
     def show(self):
         self.root.deiconify()
@@ -528,6 +675,8 @@ class App:
                 self.toggle_mute()
             elif act == "toggle":
                 self.toggle()
+            elif act == "firewall":
+                self.check_firewall(self._cur_port(), force=True)
             elif act == "quit":
                 self.quit()
                 return
@@ -590,8 +739,11 @@ class App:
             self.log(f"Não foi possível abrir a porta: {e}")
         if self.tray:
             self.tray.update_menu()
+        if self.server:
+            self.check_firewall(port)
 
     def quit(self):
+        self._save_window()
         if self.server:
             self.server.stop()
         if self.tray:
