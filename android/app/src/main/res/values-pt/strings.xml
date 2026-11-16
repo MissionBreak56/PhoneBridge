@@ -14,7 +14,7 @@
     <string name="settings">Configurações</string>
     <string name="enter_ip">Informe o IP do PC</string>
     <string name="perm_denied">Permissão de microfone negada</string>
-    <string name="notif_streaming">Transmitindo. Toque para parar</string>
+    <string name="notif_streaming">Transmitindo</string>
     <string name="notif_starting">Iniciando</string>
     <string name="pref_port">Porta do servidor</string>
     <string name="pref_audio_source">Fonte de áudio</string>
@@ -24,7 +24,37 @@
     <string name="pref_screen_on_summary">Enquanto conectado</string>
     <string name="pref_theme">Tema</string>
     <string name="pref_about">Sobre</string>
-    <string name="about_summary">PhoneBridge 1.1 – use o celular como microfone ou alto-falante do PC pelo Wi-Fi.</string>
+    <string name="about_summary">PhoneBridge 2.0 – use o celular como microfone ou alto-falante do PC pelo Wi-Fi.</string>
+    <string name="state_reconnecting">Reconectando (%1$d)…</string>
+    <string name="find_pc">Buscar PC</string>
+    <string name="qr_code">QR code</string>
+    <string name="searching">Buscando…</string>
+    <string name="no_pc_found">Nenhum PC encontrado. Confira se o PhoneBridge está aberto no PC e se os dois estão no mesmo Wi-Fi.</string>
+    <string name="choose_pc">Escolha o PC</string>
+    <string name="qr_prompt">Aponte para o QR code mostrado pelo PhoneBridge no PC</string>
+    <string name="qr_invalid">Esse QR code não é do PhoneBridge</string>
+    <string name="pc_refused">O PC recusou a conexão (confira o dispositivo de saída)</string>
+    <string name="pc_old_version">O app do PC é de uma versão antiga: usando áudio sem compressão</string>
+    <string name="pc_closed">O PC encerrou a conexão</string>
+    <string name="mic_open_failed">Não foi possível abrir o microfone</string>
+    <string name="capture_failed">Falha na captura</string>
+    <string name="battery_title">Manter o PhoneBridge funcionando</string>
+    <string name="battery_message">Para o Android não interromper o áudio com a tela apagada, permita que o PhoneBridge ignore a otimização de bateria.</string>
+    <string name="allow">Permitir</string>
+    <string name="not_now">Agora não</string>
+    <string name="pref_codec">Compressão do áudio</string>
+    <string name="pref_reconnect">Reconectar automaticamente</string>
+    <string name="pref_reconnect_summary">Continua tentando se o Wi-Fi ou a conexão com o PC cair</string>
+    <string name="pref_aec">Cancelamento de eco</string>
+    <string name="pref_aec_summary">No modo microfone, se o celular suportar</string>
+    <string name="pref_ns">Supressão de ruído</string>
+    <string name="pref_ns_summary">No modo microfone, se o celular suportar</string>
+    <string name="pref_battery">Otimização de bateria</string>
+    <string name="pref_battery_summary">Permitir funcionar com a tela apagada</string>
+    <string-array name="codec_entries">
+        <item>Sem compressão (PCM)</item>
+        <item>Opus (usa menos Wi-Fi, experimental)</item>
+    </string-array>
     <string-array name="audio_source_entries">
         <item>Padrão</item>
         <item>Microfone</item>

@@ -1,4 +1,6 @@
 numpy
-pyaudiowpatch
+pyaudiowpatch; sys_platform == "win32"
 pystray
 Pillow
+qrcode
+opuslib-next

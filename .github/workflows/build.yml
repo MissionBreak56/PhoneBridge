@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Versão da release (ex.: v1.0.0); vazio = só compilar"
+        description: "Versão da release (ex.: v2.0.0); vazio = só compilar"
         required: false
 
 jobs:
@@ -29,26 +29,95 @@ jobs:
           name: PhoneBridge-android-apk
           path: android/app/build/outputs/apk/debug/*.apk
 
-  pc:
+  pc-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build PC server exe
+      - name: Opus (vcpkg)
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows
+          $bin = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows\bin"
+          Get-ChildItem $bin
+          Copy-Item (Join-Path $bin "opus.dll") pc\opus.dll
+      - name: Dependências e testes
+        shell: pwsh
         working-directory: pc
         run: |
           pip install -r requirements.txt pyinstaller
-          pyinstaller --onefile --noconsole --icon icon.ico --name PhoneBridgeServer --hidden-import pystray._win32 server.py
+          $env:PATH = "$PWD;$env:PATH"
+          python tests/test_engine.py
+      - name: Gerar o PhoneBridgeServer.exe
+        shell: pwsh
+        working-directory: pc
+        run: |
+          pyinstaller --onefile --noconsole --icon icon.ico --name PhoneBridgeServer --hidden-import pystray._win32 --add-binary "opus.dll;." server.py
+      - name: Teste de fumaça do .exe (abre e continua rodando)
+        shell: pwsh
+        run: |
+          Start-Process pc\dist\PhoneBridgeServer.exe -ArgumentList "--tray"
+          Start-Sleep -Seconds 10
+          if (-not (Get-Process PhoneBridgeServer -ErrorAction SilentlyContinue)) { throw "o PhoneBridgeServer.exe fechou sozinho" }
+          Stop-Process -Name PhoneBridgeServer -Force
+      - name: Instalador (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $v = "${{ inputs.version }}".TrimStart('v')
+          if (-not $v) { $v = "2.0.0" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" installer\phonebridge.iss
       - uses: actions/upload-artifact@v4
         with:
-          name: PhoneBridge-pc-exe
-          path: pc/dist/PhoneBridgeServer.exe
+          name: PhoneBridge-pc-windows
+          path: |
+            pc/dist/PhoneBridgeServer.exe
+            dist-installer/PhoneBridgeSetup.exe
+
+  pc-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pacotes do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv python3-pip libopus0 pulseaudio-utils xvfb
+      - name: Dependências e testes
+        working-directory: pc
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -r requirements.txt pyinstaller
+          python tests/test_engine.py
+      - name: Gerar o binário
+        working-directory: pc
+        run: |
+          . .venv/bin/activate
+          pyinstaller --onefile --name PhoneBridgeServer-linux --add-binary "/usr/lib/x86_64-linux-gnu/libopus.so.0:." server.py
+      - name: Teste de fumaça (abre e continua rodando)
+        working-directory: pc
+        run: |
+          set +e
+          timeout 10 xvfb-run -a ./dist/PhoneBridgeServer-linux --tray
+          rc=$?
+          echo "código de saída: $rc"
+          test "$rc" = "124"
+      - name: Empacotar
+        run: |
+          mkdir -p out/PhoneBridge-linux
+          cp pc/dist/PhoneBridgeServer-linux out/PhoneBridge-linux/
+          cp README.md PROTOCOL.md out/PhoneBridge-linux/
+          tar -C out -czf PhoneBridgeServer-linux.tar.gz PhoneBridge-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneBridge-pc-linux
+          path: PhoneBridgeServer-linux.tar.gz
 
   release:
     if: github.event_name == 'workflow_dispatch' && inputs.version != ''
-    needs: [android, pc]
+    needs: [android, pc-windows, pc-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -60,14 +129,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          find dist -type f
           mv dist/PhoneBridge-android-apk/*.apk PhoneBridge-android.apk
-          mv dist/PhoneBridge-pc-exe/PhoneBridgeServer.exe PhoneBridgeServer.exe
-          gh release create "${{ inputs.version }}" --target "${{ github.sha }}" PhoneBridge-android.apk PhoneBridgeServer.exe \
+          mv dist/PhoneBridge-pc-windows/pc/dist/PhoneBridgeServer.exe PhoneBridgeServer.exe 2>/dev/null || mv dist/PhoneBridge-pc-windows/PhoneBridgeServer.exe PhoneBridgeServer.exe
+          mv dist/PhoneBridge-pc-windows/dist-installer/PhoneBridgeSetup.exe PhoneBridgeSetup.exe 2>/dev/null || mv dist/PhoneBridge-pc-windows/PhoneBridgeSetup.exe PhoneBridgeSetup.exe
+          mv dist/PhoneBridge-pc-linux/PhoneBridgeServer-linux.tar.gz PhoneBridgeServer-linux.tar.gz
+          gh release create "${{ inputs.version }}" --target "${{ github.sha }}" \
+            PhoneBridge-android.apk PhoneBridgeSetup.exe PhoneBridgeServer.exe PhoneBridgeServer-linux.tar.gz \
             --repo "${{ github.repository }}" --title "PhoneBridge ${{ inputs.version }}" --notes-file - <<'NOTES'
           Use o celular Android como microfone ou alto-falante do PC pelo Wi-Fi.
 
-          - PhoneBridge-android.apk: instale no celular (APK de depuração; permita fontes desconhecidas).
-          - PhoneBridgeServer.exe: servidor para Windows (interface escura, fica na bandeja ao fechar a janela, botão de silenciar microfone). Para o modo microfone, instale o VB-Cable (https://vb-audio.com/Cable/).
+          **Arquivos**
+          - `PhoneBridge-android.apk`: app do celular (APK de depuração; permita fontes desconhecidas).
+          - `PhoneBridgeSetup.exe`: instalador para Windows (atalhos, iniciar com o Windows, Firewall e redes privadas).
+          - `PhoneBridgeServer.exe`: versão portátil para Windows, sem instalar.
+          - `PhoneBridgeServer-linux.tar.gz`: servidor para Linux (precisa de PulseAudio ou PipeWire com `pactl`, `parec` e `pacat`).
+
+          **Novidades da 2.0**
+          - Encontra o PC sozinho na rede (botão Buscar PC) e conecta lendo um QR code.
+          - Reconecta automaticamente se o Wi-Fi cair.
+          - Compressão Opus opcional (usa menos Wi-Fi), cancelamento de eco e supressão de ruído.
+          - Serviço em primeiro plano com botão Parar e pedido de isenção de bateria.
+          - PC: medidor de nível, iniciar com o Windows, firewall e redes privadas automáticos, instalação guiada do VB-Cable, versão para Linux.
+          - Protocolo documentado em PROTOCOL.md.
 
           Sem criptografia nem senha: use só em rede confiável.
           NOTES

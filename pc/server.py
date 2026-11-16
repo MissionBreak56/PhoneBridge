@@ -1,39 +1,42 @@
 #!/usr/bin/env python3
-"""PhoneBridge - lado PC (Windows).
+"""PhoneBridge - lado PC (Windows e Linux).
 
-Servidor TCP que recebe conexões do app Android:
-  modo 1 (microfone):     celular -> PC, toca num dispositivo de saída (ex.: VB-Cable)
-  modo 2 (alto-falante):  PC -> celular, captura o som do sistema (WASAPI loopback)
+Interface gráfica do servidor. A lógica de rede está em engine.py, o protocolo em
+protocol.py e o áudio em audio_backend.py. Protocolo documentado em ../PROTOCOL.md.
 
-Protocolo (TCP, porta padrão 5800):
-  celular -> PC : "PAB1" + 1 byte de modo
-  PC -> celular : 1 byte status (0 = ok), 4 bytes taxa (big endian), 1 byte canais
-  depois: PCM 16 bits little-endian cru, sem enquadramento.
+Uso:  server.py [--tray]    (--tray: inicia escondido na bandeja e já liga o servidor)
 """
-import collections
-import ctypes
 import json
 import os
 import queue
 import socket
-import struct
-import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
-import numpy as np
-import pyaudiowpatch as pyaudio
-import pystray
 from PIL import Image, ImageDraw, ImageTk
 
-MAGIC = b"PAB1"
-MODE_MIC = 1
-MODE_SPEAKER = 2
-DEFAULT_PORT = 5800
-VBCABLE_URL = "https://vb-audio.com/Cable/"
+try:
+    import pystray
+except Exception:  # noqa: BLE001 - alguns desktops Linux não têm backend de bandeja
+    os.environ["PYSTRAY_BACKEND"] = "xorg"
+    try:
+        import importlib
+
+        pystray = importlib.import_module("pystray")
+    except Exception:  # noqa: BLE001
+        pystray = None
+
+import protocol as pr
+import sysutil
+from audio_backend import IS_WIN, create_backend
+from engine import BridgeServer
+
+APP_VERSION = "2.0.0"
+DEFAULT_PORT = pr.DEFAULT_PORT
 SINGLE_PORT = 47653  # trava local para permitir só uma janela aberta
 
 
@@ -55,237 +58,6 @@ def acquire_single_instance():
         return None
 
 
-def recv_exact(conn, n):
-    buf = bytearray()
-    while len(buf) < n:
-        part = conn.recv(n - len(buf))
-        if not part:
-            raise ConnectionError("conexão encerrada")
-        buf += part
-    return bytes(buf)
-
-
-def list_output_devices():
-    p = pyaudio.PyAudio()
-    try:
-        api = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        result = []
-        for i in range(p.get_device_count()):
-            d = p.get_device_info_by_index(i)
-            if (
-                d["hostApi"] == api["index"]
-                and d["maxOutputChannels"] > 0
-                and not d.get("isLoopbackDevice", False)
-            ):
-                result.append((i, d["name"]))
-        return result
-    finally:
-        p.terminate()
-
-
-class BridgeServer:
-    def __init__(self, port, output_index, log):
-        self.port = port
-        self.output_index = output_index
-        self.log = log
-        self.running = False
-        self.sock = None
-        self.conns = set()
-        self.clients = {}  # conn -> (ip, modo)
-        self.muted = False
-        self.lock = threading.Lock()
-
-    def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", self.port))
-        self.sock.listen(4)
-        self.sock.settimeout(1.0)
-        self.running = True
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-        self.log(f"Servidor aguardando na porta {self.port}")
-
-    def stop(self):
-        self.running = False
-        with self.lock:
-            for c in list(self.conns):
-                try:
-                    c.close()
-                except OSError:
-                    pass
-            self.conns.clear()
-            self.clients.clear()
-        if self.sock:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-        self.log("Servidor parado")
-
-    def _accept_loop(self):
-        while self.running:
-            try:
-                conn, addr = self.sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)  # pouco atraso acumulado no TCP
-            with self.lock:
-                self.conns.add(conn)
-            threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
-
-    def _handle(self, conn, addr):
-        self.log(f"Conectado: {addr[0]}")
-        try:
-            hdr = recv_exact(conn, 5)
-            if hdr[:4] != MAGIC:
-                raise ValueError("handshake inválido")
-            mode = hdr[4]
-            with self.lock:
-                self.clients[conn] = (addr[0], mode)
-            if mode == MODE_MIC:
-                self._mic(conn)
-            elif mode == MODE_SPEAKER:
-                self._speaker(conn)
-            else:
-                conn.sendall(struct.pack(">BIB", 1, 0, 0))
-        except Exception as e:  # noqa: BLE001
-            if self.running:
-                self.log(f"Erro: {e}")
-        finally:
-            try:
-                conn.close()
-            except OSError:
-                pass
-            with self.lock:
-                self.conns.discard(conn)
-                self.clients.pop(conn, None)
-            self.log(f"Desconectado: {addr[0]}")
-
-    # celular -> PC
-    def _mic(self, conn):
-        if self.output_index is None:
-            conn.sendall(struct.pack(">BIB", 1, 0, 0))
-            raise RuntimeError("nenhum dispositivo de saída selecionado")
-        p = pyaudio.PyAudio()
-        stream = None
-        try:
-            dev = p.get_device_info_by_index(self.output_index)
-            rate = int(dev["defaultSampleRate"])
-            out_ch = 2 if dev["maxOutputChannels"] >= 2 else 1
-            conn.sendall(struct.pack(">BIB", 0, rate, 1))  # celular envia mono
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=out_ch,
-                rate=rate,
-                output=True,
-                output_device_index=self.output_index,
-                frames_per_buffer=rate // 100,
-            )
-            self.log(f"Microfone: {rate} Hz -> {dev['name']}")
-            chunk = rate // 100 * 2
-            q = collections.deque()
-            cv = threading.Condition()
-            st = {"dead": False, "err": None}
-
-            def reader():
-                # lê sempre, para o TCP não acumular; guarda no máximo ~60 ms
-                try:
-                    while self.running:
-                        d = recv_exact(conn, chunk)
-                        with cv:
-                            q.append(d)
-                            if len(q) > 6:
-                                while len(q) > 2:
-                                    q.popleft()
-                            cv.notify()
-                except Exception as e:  # noqa: BLE001
-                    st["err"] = e
-                finally:
-                    with cv:
-                        st["dead"] = True
-                        cv.notify()
-
-            threading.Thread(target=reader, daemon=True).start()
-            with cv:  # pré-buffer mínimo (20 ms) contra picos do Wi-Fi
-                while len(q) < 2 and not st["dead"] and self.running:
-                    cv.wait(0.2)
-            while self.running:
-                with cv:
-                    while not q and not st["dead"] and self.running:
-                        cv.wait(0.2)
-                    if not q:
-                        break
-                    data = q.popleft()
-                if self.muted:
-                    data = bytes(len(data))  # silêncio, mantém o ritmo do stream
-                if out_ch == 2:
-                    data = np.repeat(np.frombuffer(data, dtype=np.int16), 2).tobytes()
-                stream.write(data)
-            if st["err"] and self.running:
-                raise st["err"]
-        finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
-            p.terminate()
-
-    # PC -> celular
-    def _speaker(self, conn):
-        p = pyaudio.PyAudio()
-        stream = None
-        try:
-            try:
-                lb = p.get_default_wasapi_loopback()
-            except Exception:
-                conn.sendall(struct.pack(">BIB", 1, 0, 0))
-                raise RuntimeError("loopback WASAPI indisponível")
-            rate = int(lb["defaultSampleRate"])
-            in_ch = int(lb["maxInputChannels"])
-            out_ch = 1 if in_ch == 1 else 2
-            conn.sendall(struct.pack(">BIB", 0, rate, out_ch))
-            q = queue.Queue(maxsize=8)  # ~80 ms; descarta o mais antigo
-
-            def cb(in_data, frame_count, time_info, status):
-                try:
-                    q.put_nowait(in_data)
-                except queue.Full:
-                    try:
-                        q.get_nowait()
-                        q.put_nowait(in_data)
-                    except (queue.Empty, queue.Full):
-                        pass
-                return (None, pyaudio.paContinue)
-
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=in_ch,
-                rate=rate,
-                input=True,
-                input_device_index=lb["index"],
-                frames_per_buffer=rate // 100,
-                stream_callback=cb,
-            )
-            self.log(f"Alto-falante: {rate} Hz, {out_ch} canal(is) <- {lb['name']}")
-            silence = bytes(rate // 100 * out_ch * 2)
-            while self.running:
-                try:
-                    data = q.get(timeout=0.05)
-                except queue.Empty:
-                    data = silence  # loopback não gera dados em silêncio
-                if in_ch > 2:
-                    arr = np.frombuffer(data, dtype=np.int16).reshape(-1, in_ch)
-                    data = np.ascontiguousarray(arr[:, :2]).tobytes()
-                conn.sendall(data)
-        finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
-            p.terminate()
-
-
 # ---------------------------------------------------------------- interface
 BG = "#0f1115"
 SURFACE = "#181b21"
@@ -296,9 +68,13 @@ ACCENT = "#4f8cff"
 ACCENT_HOVER = "#6b9fff"
 DANGER = "#ef5350"
 OK = "#3ddc84"
-FONT = "Segoe UI"
+FONT = "Segoe UI" if IS_WIN else "DejaVu Sans"
 
-CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PhoneBridge", "config.json")
+if IS_WIN:
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PhoneBridge")
+else:
+    CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "phonebridge")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 
 def load_config():
@@ -318,37 +94,6 @@ def save_config(cfg):
         pass
 
 
-# ---- Firewall do Windows (regra de entrada para a porta do servidor)
-NO_WINDOW = 0x08000000
-
-
-def fw_rule_name(port):
-    return f"PhoneBridge {port}"
-
-
-def fw_rule_exists(port):
-    if os.name != "nt":
-        return True
-    try:
-        r = subprocess.run(
-            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={fw_rule_name(port)}"],
-            capture_output=True, creationflags=NO_WINDOW, timeout=10,
-        )
-        return r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return True  # não deu para checar: melhor não incomodar
-
-
-def fw_add_rule_elevated(port):
-    """Pede permissão de administrador (UAC) e cria a regra. True se o pedido foi aceito."""
-    params = (f'advfirewall firewall add rule name="{fw_rule_name(port)}" dir=in action=allow '
-              f'protocol=TCP localport={port} remoteip=localsubnet profile=any')
-    try:
-        return ctypes.windll.shell32.ShellExecuteW(None, "runas", "netsh", params, None, 0) > 32
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def make_icon(size=64, muted=False):
     """Ícone minimalista: quadrado escuro arredondado com um microfone."""
     s = size * 4
@@ -366,6 +111,16 @@ def make_icon(size=64, muted=False):
     return img.resize((size, size), Image.LANCZOS)
 
 
+def make_qr_image(data, size=300):
+    import qrcode
+
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").get_image().convert("RGB")
+    return img.resize((size, size), Image.NEAREST)
+
+
 class FlatButton(tk.Label):
     def __init__(self, master, text, command, bg=ACCENT, hover=ACCENT_HOVER, fg="#ffffff"):
         super().__init__(master, text=text, bg=bg, fg=fg, font=(FONT, 11, "bold"),
@@ -381,24 +136,27 @@ class FlatButton(tk.Label):
 
 
 class App:
-    def __init__(self, root, lock=None):
+    def __init__(self, root, lock=None, start_hidden=False):
         self.root = root
         self.lock_sock = lock
         self.cfg = load_config()
+        self.backend = create_backend()
         self.server = None
         self.muted = False
         self.log_q = queue.Queue()
         self.ui_q = queue.Queue()
         self.devices = []
-        self.has_cable = False
         self.tray = None
         self.hint_shown = False
+        self.level_disp = 0.0
+        self.net_busy = False
+        self.qr_win = None
+        self.asked_this_session = False
 
         root.title("PhoneBridge")
         self._win_job = None
-        self._fw_busy = False
         self._restore_window()
-        root.minsize(400, 640)
+        root.minsize(400, 760)
         root.configure(bg=BG)
         self.win_icon = ImageTk.PhotoImage(make_icon(64))
         root.iconphoto(True, self.win_icon)
@@ -410,7 +168,7 @@ class App:
 
         tk.Label(wrap, text="PhoneBridge", bg=BG, fg=TEXT, font=(FONT, 22, "bold")).pack(anchor="w")
         row = tk.Frame(wrap, bg=BG)
-        row.pack(anchor="w", pady=(2, 16))
+        row.pack(anchor="w", pady=(2, 14))
         self.dot = tk.Canvas(row, width=10, height=10, bg=BG, highlightthickness=0)
         self.dot.pack(side="left", padx=(0, 8))
         self.dot_id = self.dot.create_oval(1, 1, 9, 9, fill=MUTED_TXT, outline="")
@@ -419,9 +177,9 @@ class App:
 
         self._label(wrap, "PORTA")
         self.port_var = tk.StringVar(value=str(self.cfg.get("port", DEFAULT_PORT)))
-        ttk.Entry(wrap, textvariable=self.port_var, style="D.TEntry").pack(fill="x", pady=(4, 12), ipady=4)
+        ttk.Entry(wrap, textvariable=self.port_var, style="D.TEntry").pack(fill="x", pady=(4, 10), ipady=4)
 
-        self._label(wrap, "SAÍDA DO MICROFONE (EX.: CABLE INPUT)")
+        self._label(wrap, "SAÍDA DO MICROFONE" + (" (EX.: CABLE INPUT)" if IS_WIN else " (PHONEBRIDGE MIC)"))
         self.dev_var = tk.StringVar()
         self.combo = ttk.Combobox(wrap, textvariable=self.dev_var, state="readonly", style="D.TCombobox")
         self.combo.pack(fill="x", pady=(4, 6), ipady=4)
@@ -429,80 +187,78 @@ class App:
                                   justify="left", wraplength=390)
         self.cable_lbl.pack(anchor="w")
         tools = tk.Frame(wrap, bg=BG)
-        tools.pack(anchor="w", pady=(6, 12))
-        for txt, cmd in (("Baixar VB-Cable", lambda: webbrowser.open(VBCABLE_URL)),
-                         ("Atualizar", self.refresh_devices),
-                         ("Config. de som", self.open_sound)):
+        tools.pack(anchor="w", pady=(6, 10))
+        buttons = []
+        if IS_WIN:
+            buttons.append(("Instalar VB-Cable", self.install_cable))
+        buttons += [("Atualizar", self.refresh_devices), ("Config. de som", self.open_sound)]
+        for txt, cmd in buttons:
             b = FlatButton(tools, txt, cmd, bg=SURFACE, hover=BORDER, fg=TEXT)
             b.config(font=(FONT, 9), pady=5, padx=10)
             b.pack(side="left", padx=(0, 6))
+        if IS_WIN:
+            self.backend_ready = True
+        else:
+            self.backend.prepare()
         self.refresh_devices()
 
-        try:
-            ips = [i for i in socket.gethostbyname_ex(socket.gethostname())[2] if not i.startswith("127.")]
-        except OSError:
-            ips = []
         self._label(wrap, "IP DESTE PC")
+        ips = pr.local_ips()
         tk.Label(wrap, text="   ".join(ips) or "indisponível", bg=BG, fg=TEXT,
-                 font=(FONT, 11), justify="left", wraplength=360).pack(anchor="w", pady=(4, 16))
+                 font=(FONT, 11), justify="left", wraplength=360).pack(anchor="w", pady=(4, 6))
+        qr_btn = FlatButton(wrap, "Mostrar QR code para conectar", self.show_qr, bg=SURFACE, hover=BORDER, fg=TEXT)
+        qr_btn.config(font=(FONT, 9), pady=6)
+        qr_btn.pack(fill="x", pady=(0, 12))
 
         self.btn = FlatButton(wrap, "Iniciar servidor", self.toggle)
         self.btn.pack(fill="x")
         self.mute_btn = FlatButton(wrap, "Silenciar microfone", self.toggle_mute,
                                    bg=SURFACE, hover=BORDER, fg=TEXT)
-        self.mute_btn.pack(fill="x", pady=(10, 16))
+        self.mute_btn.pack(fill="x", pady=(10, 12))
+
+        self._label(wrap, "NÍVEL DO ÁUDIO")
+        self.meter = tk.Canvas(wrap, height=12, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        self.meter.pack(fill="x", pady=(4, 12))
+        self.meter_bar = self.meter.create_rectangle(0, 0, 0, 12, fill=OK, outline="")
+
+        opts = tk.Frame(wrap, bg=BG)
+        opts.pack(anchor="w", pady=(0, 10))
+        self.opus_var = tk.BooleanVar(value=bool(self.cfg.get("opus", True)))
+        self._check(opts, "Permitir compressão Opus (se o celular pedir)", self.opus_var, self._opts_changed)
+        self.auto_var = tk.BooleanVar(value=sysutil.is_autostart())
+        self._check(opts, "Iniciar com o Windows" if IS_WIN else "Iniciar com o sistema",
+                    self.auto_var, self._autostart_changed)
 
         self._label(wrap, "REGISTRO")
         box = tk.Frame(wrap, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         box.pack(fill="both", expand=True, pady=(4, 0))
         self.logbox = tk.Text(box, height=6, bg=SURFACE, fg=MUTED_TXT, relief="flat", bd=0,
-                              font=("Consolas", 9), state="disabled", wrap="word",
-                              padx=8, pady=6, insertbackground=TEXT)
+                              font=("Consolas" if IS_WIN else "DejaVu Sans Mono", 9), state="disabled",
+                              wrap="word", padx=8, pady=6, insertbackground=TEXT)
         self.logbox.pack(fill="both", expand=True)
 
         root.protocol("WM_DELETE_WINDOW", self.hide)
         root.bind("<Configure>", self._on_configure)
         self._start_tray()
         self.poll()
-        root.after(1200, lambda: self.check_firewall(self._cur_port()))
+        if IS_WIN:
+            root.after(1500, self._net_check_async)
+            root.after(60000, self._net_watch)
         if lock is not None:
             threading.Thread(target=self._listen_show, args=(lock,), daemon=True).start()
+        if start_hidden:
+            root.withdraw()
+            root.after(600, self.toggle)  # liga o servidor sozinho ao iniciar com o sistema
 
-    def _listen_show(self, lock):
-        while True:
-            try:
-                conn, _ = lock.accept()
-            except OSError:
-                return
-            with conn:
-                try:
-                    conn.recv(8)
-                except OSError:
-                    pass
-            self.ui_q.put("show")  # traz a janela existente à frente
+    # ---- pequenos helpers de interface
+    def _check(self, parent, text, var, cmd):
+        tk.Checkbutton(parent, text=text, variable=var, command=cmd, bg=BG, fg=TEXT, selectcolor=SURFACE,
+                       activebackground=BG, activeforeground=TEXT, font=(FONT, 9), anchor="w",
+                       highlightthickness=0, bd=0).pack(anchor="w")
 
-    def refresh_devices(self):
-        self.devices = list_output_devices()
-        names = [n for _, n in self.devices]
-        self.combo["values"] = names
-        cable = next((n for n in names if "CABLE Input" in n), None)
-        if self.dev_var.get() not in names:
-            saved = self.cfg.get("device")
-            self.dev_var.set(saved if saved in names else (cable or (names[0] if names else "")))
-        self.has_cable = cable is not None
-        if cable:
-            self.cable_lbl.config(text='VB-Cable detectado. Nos apps (Discord, Zoom...) escolha "CABLE Output" como microfone.')
-        else:
-            self.cable_lbl.config(text="VB-Cable não encontrado. Necessário só para usar o celular como microfone "
-                                       "(instale, reinicie o Windows e clique em Atualizar).")
+    def _label(self, parent, text):
+        tk.Label(parent, text=text, bg=BG, fg=MUTED_TXT, font=(FONT, 8, "bold")).pack(anchor="w")
 
-    def open_sound(self):
-        try:
-            os.startfile("ms-settings:sound")  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
-            self.log("Não foi possível abrir as configurações de som")
-
-    # ---- helpers de estilo
     def _style(self):
         st = ttk.Style(self.root)
         st.theme_use("clam")
@@ -517,40 +273,137 @@ class App:
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
-    def _label(self, parent, text):
-        tk.Label(parent, text=text, bg=BG, fg=MUTED_TXT, font=(FONT, 8, "bold")).pack(anchor="w")
+    def _listen_show(self, lock):
+        while True:
+            try:
+                conn, _ = lock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(8)
+                except OSError:
+                    pass
+            self.ui_q.put("show")  # traz a janela existente à frente
+
+    # ---- dispositivos
+    def refresh_devices(self):
+        try:
+            self.devices = self.backend.list_output_devices()
+        except Exception as e:  # noqa: BLE001
+            self.devices = []
+            self.log(f"Não foi possível listar os dispositivos de áudio: {e}")
+        names = [n for _, n in self.devices]
+        self.combo["values"] = names
+        if self.dev_var.get() not in names:
+            saved = self.cfg.get("device")
+            pref = self.backend.preferred_device(self.devices)
+            pref_name = next((n for i, n in self.devices if i == pref), None)
+            self.dev_var.set(saved if saved in names else (pref_name or (names[0] if names else "")))
+        self.cable_lbl.config(text=self.backend.virtual_mic_hint())
+
+    def open_sound(self):
+        try:
+            if IS_WIN:
+                os.startfile("ms-settings:sound")  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(["pavucontrol"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001
+            self.log("Não foi possível abrir as configurações de som")
+
+    # ---- VB-Cable guiado (Windows)
+    def install_cable(self):
+        if self.backend.virtual_mic_ready():
+            messagebox.showinfo("PhoneBridge", "O VB-Cable já está instalado. Se não aparecer na lista, "
+                                "clique em Atualizar (ou reinicie o Windows).", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "PhoneBridge - VB-Cable",
+            "O VB-Cable é um driver de áudio virtual gratuito (vb-audio.com) que faz o PC enxergar o "
+            "celular como um microfone.\n\nO PhoneBridge vai baixar o pacote oficial e abrir o instalador. "
+            "Você só precisa:\n\n1. Confirmar a permissão de administrador\n2. Clicar em \"Install Driver\"\n"
+            "3. Reiniciar o Windows\n4. Voltar aqui e clicar em Atualizar\n\nContinuar?",
+            parent=self.root,
+        ):
+            return
+
+        def work():
+            res = sysutil.install_vbcable(self.log)
+            if res != "ok":
+                self.log("VB-Cable: abrindo a página oficial para baixar manualmente.")
+                webbrowser.open(sysutil.VBCABLE_PAGE)
+            else:
+                self.log("VB-Cable: depois de instalar, reinicie o Windows e clique em Atualizar.")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- QR code
+    def show_qr(self):
+        ip = pr.primary_ip()
+        if not ip:
+            messagebox.showwarning("PhoneBridge", "Não foi possível descobrir o IP deste PC.", parent=self.root)
+            return
+        if self.qr_win is not None:
+            try:
+                self.qr_win.destroy()
+            except tk.TclError:
+                pass
+        payload = pr.qr_payload(ip, self._cur_port())
+        win = tk.Toplevel(self.root)
+        win.title("PhoneBridge - QR code")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        self.qr_photo = ImageTk.PhotoImage(make_qr_image(payload))
+        tk.Label(win, image=self.qr_photo, bg="white", bd=0).pack(padx=24, pady=(24, 10))
+        tk.Label(win, text=f"{ip}:{self._cur_port()}", bg=BG, fg=TEXT, font=(FONT, 12, "bold")).pack()
+        tk.Label(win, text="No celular: PhoneBridge > QR code", bg=BG, fg=MUTED_TXT,
+                 font=(FONT, 9)).pack(pady=(2, 20))
+        self.qr_win = win
 
     # ---- bandeja
     def _start_tray(self):
-        menu = pystray.Menu(
+        if pystray is None:
+            self.tray = None
+            self.log("Bandeja do sistema indisponível: o programa fica só na janela.")
+            return
+        items = [
             pystray.MenuItem("Abrir PhoneBridge", lambda: self.ui_q.put("show"), default=True),
             pystray.MenuItem(lambda item: "Reativar microfone" if self.muted else "Silenciar microfone",
                              lambda: self.ui_q.put("mute")),
             pystray.MenuItem(lambda item: "Parar servidor" if self.server else "Iniciar servidor",
                              lambda: self.ui_q.put("toggle")),
-            pystray.MenuItem("Liberar no Firewall", lambda: self.ui_q.put("firewall")),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Sair", lambda: self.ui_q.put("quit")),
-        )
-        self.tray = pystray.Icon("PhoneBridge", make_icon(64), "PhoneBridge", menu)
-        self.tray.run_detached()
+            pystray.MenuItem("Mostrar QR code", lambda: self.ui_q.put("qr")),
+        ]
+        if IS_WIN:
+            items.append(pystray.MenuItem("Liberar no Firewall e redes privadas", lambda: self.ui_q.put("firewall")))
+        items += [pystray.Menu.SEPARATOR, pystray.MenuItem("Sair", lambda: self.ui_q.put("quit"))]
+        self.tray = pystray.Icon("PhoneBridge", make_icon(64), "PhoneBridge", pystray.Menu(*items))
+        try:
+            self.tray.run_detached()
+        except Exception as e:  # noqa: BLE001 - sem bandeja disponível (alguns desktops Linux)
+            self.tray = None
+            self.log(f"Bandeja do sistema indisponível: {e}")
 
     # ---- lembrar posição/tamanho da janela
     def _virtual_screen(self):
         try:
+            import ctypes
+
             u = ctypes.windll.user32
             return u.GetSystemMetrics(76), u.GetSystemMetrics(77), u.GetSystemMetrics(78), u.GetSystemMetrics(79)
         except Exception:  # noqa: BLE001
             return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _restore_window(self):
-        geo = "440x720"
+        geo = "440x800"
         w = self.cfg.get("window")
         if isinstance(w, dict):
             try:
                 vx, vy, vw, vh = self._virtual_screen()
                 ww = max(400, min(int(w["w"]), vw))
-                hh = max(640, min(int(w["h"]), vh))
+                hh = max(760, min(int(w["h"]), vh))
                 x = max(vx, min(int(w["x"]), vx + vw - ww))  # garante que fique dentro de alguma tela
                 y = max(vy, min(int(w["y"]), vy + vh - hh))
                 geo = f"{ww}x{hh}+{x}+{y}"
@@ -586,69 +439,118 @@ class App:
             return
         save_config(self.cfg)
 
-    # ---- firewall
+    # ---- opções
+    def _opts_changed(self):
+        self.cfg["opus"] = bool(self.opus_var.get())
+        save_config(self.cfg)
+        if self.server:
+            self.server.opus_allowed = self.cfg["opus"]
+
+    def _autostart_changed(self):
+        ok = sysutil.set_autostart(bool(self.auto_var.get()))
+        if not ok:
+            self.auto_var.set(sysutil.is_autostart())
+            self.log("Não foi possível alterar a inicialização automática.")
+        else:
+            self.log("Vai iniciar com o sistema." if self.auto_var.get() else "Não vai mais iniciar com o sistema.")
+
+    # ---- firewall e rede privada (Windows)
     def _cur_port(self):
         try:
             return int(self.port_var.get())
         except ValueError:
             return DEFAULT_PORT
 
-    def check_firewall(self, port, force=False):
-        if os.name != "nt" or self._fw_busy:
+    def _net_needs(self, port):
+        missing = not sysutil.fw_rules_ok(port)
+        pubs = sysutil.public_networks()
+        declined_fw = port in self.cfg.get("fw_declined", [])
+        declined_nets = set(self.cfg.get("net_declined", []))
+        pubs = [n for n in pubs if n not in declined_nets]
+        return (missing and not declined_fw), pubs
+
+    def _net_check_async(self, force=False):
+        if not IS_WIN or self.net_busy:
             return
-        if fw_rule_exists(port):
+        port = self._cur_port()
+
+        def work():
             if force:
-                self.log(f"Firewall: a regra para a porta {port} já existe.")
+                self.ui_q.put(("ask_net", port, not sysutil.fw_rules_ok(port), sysutil.public_networks(), True))
+                return
+            missing, pubs = self._net_needs(port)
+            if missing or pubs:
+                self.ui_q.put(("ask_net", port, missing, pubs, False))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _net_watch(self):
+        # a cada minuto vê se o PC entrou numa rede Pública nova (só pergunta uma vez por rede)
+        if self.server:
+            self._net_check_async()
+        self.root.after(60000, self._net_watch)
+
+    def _ask_net(self, port, missing, pubs, force):
+        if self.net_busy or (not force and self.asked_this_session and not pubs):
             return
-        declined = self.cfg.setdefault("fw_declined", [])
-        if port in declined and not force:
+        if not missing and not pubs and not force:
+            return
+        parts = []
+        if missing or force:
+            parts.append(f"• criar regras no Firewall do Windows liberando a porta {port} (TCP) e a porta "
+                         f"{pr.DISCOVERY_PORT} (UDP, descoberta automática) somente para dispositivos da sua rede local")
+        if pubs:
+            parts.append("• mudar para \"Privada\" as redes conectadas agora que estão como \"Pública\": "
+                         + ", ".join(pubs))
+        if not parts:
+            self.log("Firewall e redes já estão configurados.")
             return
         ok = messagebox.askyesno(
-            "PhoneBridge - Firewall",
-            f"Para o celular conseguir conectar neste PC mesmo com a rede como \"Pública\", "
-            f"o PhoneBridge pode criar uma regra no Firewall do Windows liberando a porta {port} "
-            f"somente para dispositivos da sua rede local.\n\n"
-            f"O Windows vai pedir permissão de administrador. Criar a regra agora?",
+            "PhoneBridge - Rede e Firewall",
+            "Para o celular conseguir conectar neste PC, o PhoneBridge pode:\n\n" + "\n".join(parts) +
+            "\n\nO Windows vai pedir permissão de administrador. Aplicar agora?",
             parent=self.root,
         )
+        self.asked_this_session = True
         if not ok:
-            if port not in declined:
-                declined.append(port)
-                save_config(self.cfg)
-            self.log("Firewall: regra não criada. Se o celular não conectar, deixe a rede como Privada "
-                     'ou use o menu da bandeja > "Liberar no Firewall".')
-            return
-        if port in declined:
-            declined.remove(port)
+            if missing and port not in self.cfg.setdefault("fw_declined", []):
+                self.cfg["fw_declined"].append(port)
+            nd = self.cfg.setdefault("net_declined", [])
+            nd.extend(n for n in pubs if n not in nd)
             save_config(self.cfg)
-        self._fw_busy = True
-        self.log("Firewall: aguardando a permissão de administrador...")
-        threading.Thread(target=self._fw_create, args=(port,), daemon=True).start()
+            self.log("Rede/Firewall: nada foi alterado. Use o menu da bandeja > \"Liberar no Firewall e redes "
+                     "privadas\" se o celular não conseguir conectar.")
+            return
+        if port in self.cfg.get("fw_declined", []):
+            self.cfg["fw_declined"].remove(port)
+        self.cfg["net_declined"] = []
+        save_config(self.cfg)
+        self.net_busy = True
+        self.log("Rede/Firewall: aguardando a permissão de administrador...")
+        threading.Thread(target=self._net_apply, args=(port,), daemon=True).start()
 
-    def _fw_create(self, port):
-        created = False
-        if fw_add_rule_elevated(port):
-            for _ in range(20):
-                time.sleep(0.5)
-                if fw_rule_exists(port):
-                    created = True
+    def _net_apply(self, port):
+        done = False
+        if sysutil.setup_network_elevated(port):
+            for _ in range(30):
+                time.sleep(1)
+                if sysutil.fw_rules_ok(port) and not sysutil.public_networks():
+                    done = True
                     break
-        if created:
-            self.log(f"Firewall: porta {port} liberada para a rede local.")
-        else:
-            declined = self.cfg.setdefault("fw_declined", [])
-            if port not in declined:
-                declined.append(port)
-                save_config(self.cfg)
-            self.log("Firewall: não foi possível criar a regra (permissão negada?).")
-        self._fw_busy = False
+        self.log("Rede/Firewall: regras criadas e redes conectadas definidas como Privadas." if done
+                 else "Rede/Firewall: não foi possível concluir (permissão negada ou rede ainda Pública).")
+        self.net_busy = False
 
+    # ---- janela
     def show(self):
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
 
     def hide(self):
+        if self.tray is None:
+            self.quit()  # sem bandeja não há como reabrir a janela
+            return
         self.root.withdraw()
         if not self.hint_shown and self.tray:
             self.hint_shown = True
@@ -669,19 +571,34 @@ class App:
             self.logbox.config(state="disabled")
         while not self.ui_q.empty():
             act = self.ui_q.get()
-            if act == "show":
+            if isinstance(act, tuple) and act[0] == "ask_net":
+                self._ask_net(*act[1:])
+            elif act == "show":
                 self.show()
             elif act == "mute":
                 self.toggle_mute()
             elif act == "toggle":
                 self.toggle()
+            elif act == "qr":
+                self.show()
+                self.show_qr()
             elif act == "firewall":
-                self.check_firewall(self._cur_port(), force=True)
+                self._net_check_async(force=True)
             elif act == "quit":
                 self.quit()
                 return
         self.update_status()
-        self.root.after(200, self.poll)
+        self.update_meter()
+        self.root.after(100, self.poll)
+
+    def update_meter(self):
+        lvl = 0.0
+        if self.server and time.time() - self.server.level_ts < 0.4:
+            lvl = min(1.0, self.server.level * 1.6)  # um pouco de ganho visual
+        self.level_disp = max(lvl, self.level_disp * 0.8)
+        w = self.meter.winfo_width()
+        self.meter.coords(self.meter_bar, 0, 0, w * self.level_disp, 12)
+        self.meter.itemconfig(self.meter_bar, fill=DANGER if self.level_disp > 0.92 else OK)
 
     def update_status(self):
         if not self.server:
@@ -690,8 +607,9 @@ class App:
             with self.server.lock:
                 clients = list(self.server.clients.values())
             if clients:
-                ips = ", ".join(sorted({ip for ip, _ in clients}))
-                text, col = f"Conectado: {ips}", OK
+                ips = ", ".join(sorted({c[0] for c in clients}))
+                codecs = {("Opus" if c[2] == pr.CODEC_OPUS else "PCM") for c in clients}
+                text, col = f"Conectado: {ips} ({'/'.join(sorted(codecs))})", OK
             else:
                 text, col = f"Aguardando conexão na porta {self.server.port}", ACCENT
         self.status.config(text=text)
@@ -725,12 +643,14 @@ class App:
             return
         idx = next((i for i, n in self.devices if n == self.dev_var.get()), None)
         try:
-            self.server = BridgeServer(port, idx, self.log)
+            self.server = BridgeServer(port, idx, self.log, self.backend, self.opus_var.get())
             self.server.muted = self.muted
             self.server.start()
-            if not self.has_cable:
-                self.log("Aviso: sem VB-Cable, o modo microfone toca só na saída escolhida; "
+            if not self.backend.virtual_mic_ready():
+                self.log("Aviso: sem microfone virtual, o modo microfone toca só na saída escolhida; "
                          "outros apps não o verão como microfone. O modo alto-falante funciona normalmente.")
+            if self.opus_var.get() and not pr.opus_available():
+                self.log("Opus indisponível neste PC (biblioteca não encontrada): usando PCM.")
             self.btn.set("Parar servidor", SURFACE, BORDER, TEXT)
             self.cfg.update(port=port, device=self.dev_var.get())
             save_config(self.cfg)
@@ -739,13 +659,14 @@ class App:
             self.log(f"Não foi possível abrir a porta: {e}")
         if self.tray:
             self.tray.update_menu()
-        if self.server:
-            self.check_firewall(port)
+        if self.server and IS_WIN:
+            self._net_check_async()
 
     def quit(self):
         self._save_window()
         if self.server:
             self.server.stop()
+        self.backend.shutdown()
         if self.tray:
             self.tray.stop()
         try:
@@ -761,5 +682,5 @@ if __name__ == "__main__":
     if lock is None:
         raise SystemExit(0)  # já está aberto: a janela existente foi trazida à frente
     root = tk.Tk()
-    App(root, lock)
+    App(root, lock, start_hidden="--tray" in sys.argv)
     root.mainloop()

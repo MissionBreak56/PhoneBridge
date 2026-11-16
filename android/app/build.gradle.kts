@@ -11,8 +11,8 @@ android {
         applicationId = "com.phonebridge"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.3"
+        versionCode = 4
+        versionName = "2.0.0"
     }
 
     buildTypes {
@@ -34,4 +34,6 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.preference:preference-ktx:1.2.1")
+    implementation("io.github.jaredmdobson:concentus:1.0.2") // Opus em Java puro (sem código nativo)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0") // leitor de QR code
 }

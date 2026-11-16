@@ -12,6 +12,32 @@
         app:key="audioSource"
         app:title="@string/pref_audio_source"
         app:useSimpleSummaryProvider="true" />
+    <ListPreference
+        app:defaultValue="0"
+        app:entries="@array/codec_entries"
+        app:entryValues="@array/codec_values"
+        app:key="codec"
+        app:title="@string/pref_codec"
+        app:useSimpleSummaryProvider="true" />
+    <SwitchPreferenceCompat
+        app:defaultValue="true"
+        app:key="autoReconnect"
+        app:summary="@string/pref_reconnect_summary"
+        app:title="@string/pref_reconnect" />
+    <SwitchPreferenceCompat
+        app:defaultValue="false"
+        app:key="aec"
+        app:summary="@string/pref_aec_summary"
+        app:title="@string/pref_aec" />
+    <SwitchPreferenceCompat
+        app:defaultValue="false"
+        app:key="ns"
+        app:summary="@string/pref_ns_summary"
+        app:title="@string/pref_ns" />
+    <Preference
+        app:key="battery"
+        app:summary="@string/pref_battery_summary"
+        app:title="@string/pref_battery" />
     <SwitchPreferenceCompat
         app:defaultValue="false"
         app:key="autoMute"

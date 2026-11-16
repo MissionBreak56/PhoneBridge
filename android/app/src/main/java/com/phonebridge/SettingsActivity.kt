@@ -28,6 +28,10 @@ class SettingsActivity : AppCompatActivity() {
             findPreference<EditTextPreference>("port")?.setOnBindEditTextListener {
                 it.inputType = InputType.TYPE_CLASS_NUMBER
             }
+            findPreference<androidx.preference.Preference>("battery")?.setOnPreferenceClickListener {
+                activity?.let { a -> MainActivity.requestIgnoreBattery(a) }
+                true
+            }
             findPreference<androidx.preference.ListPreference>("theme")?.setOnPreferenceChangeListener { _, v ->
                 MainActivity.applyTheme(v as String)
                 true

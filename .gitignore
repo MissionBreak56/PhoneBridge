@@ -6,3 +6,6 @@ dist/
 *.spec
 local.properties
 .idea/
+dist-installer/
+.venv/
+*.dll

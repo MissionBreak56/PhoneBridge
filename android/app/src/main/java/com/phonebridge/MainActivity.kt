@@ -3,8 +3,12 @@ package com.phonebridge
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.widget.Toast
 import android.view.Menu
 import android.view.MenuItem
 import android.view.WindowManager
@@ -14,6 +18,9 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.preference.PreferenceManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.textfield.TextInputEditText
 import android.widget.TextView
@@ -21,6 +28,17 @@ import android.widget.TextView
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        /** Abre a tela do Android que permite ignorar a otimização de bateria deste app. */
+        fun requestIgnoreBattery(a: android.app.Activity) {
+            try {
+                a.startActivity(
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${a.packageName}"))
+                )
+            } catch (_: Exception) {
+                try { a.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) {}
+            }
+        }
+
         fun applyTheme(v: String) {
             AppCompatDelegate.setDefaultNightMode(
                 when (v) {
@@ -39,6 +57,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var muteSwitch: MaterialSwitch
     private lateinit var levelText: TextView
     private lateinit var levelSeek: SeekBar
+    private lateinit var scanButton: MaterialButton
+    private lateinit var qrButton: MaterialButton
+    private var scanning = false
+
+    private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val text = result.contents ?: return@registerForActivityResult
+        handleQr(text)
+    }
 
     private val prefs by lazy { PreferenceManager.getDefaultSharedPreferences(this) }
 
@@ -54,6 +80,8 @@ class MainActivity : AppCompatActivity() {
         muteSwitch = findViewById(R.id.muteSwitch)
         levelText = findViewById(R.id.levelText)
         levelSeek = findViewById(R.id.levelSeek)
+        scanButton = findViewById(R.id.scanButton)
+        qrButton = findViewById(R.id.qrButton)
 
         ipField.setText(prefs.getString("ip", ""))
         modeGroup.check(if (prefs.getInt("mode", 1) == 2) R.id.modeSpeaker else R.id.modeMic)
@@ -62,6 +90,8 @@ class MainActivity : AppCompatActivity() {
         updateLevelText()
 
         mainButton.setOnClickListener { toggle() }
+        scanButton.setOnClickListener { searchPcs(silent = false) }
+        qrButton.setOnClickListener { scanQr() }
         modeGroup.addOnButtonCheckedListener { _, _, _ -> updateLevelText() }
         muteSwitch.setOnCheckedChangeListener { _, checked -> AudioService.muted = checked }
         levelSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -74,6 +104,9 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar) {}
         })
         muteSwitch.isChecked = AudioService.muted
+
+        // primeira vez (ainda sem IP): procura sozinho
+        if (savedInstanceState == null && ipField.text.isNullOrBlank()) searchPcs(silent = true)
     }
 
     override fun onStart() {
@@ -101,11 +134,14 @@ class MainActivity : AppCompatActivity() {
             AudioService.STATE_STARTING -> getString(R.string.state_starting)
             else -> AudioService.errorMessage ?: getString(R.string.state_stopped)
         }
+        if (state == AudioService.STATE_STARTING && AudioService.info != null) stateText.text = AudioService.info
         mainButton.text = getString(if (state == AudioService.STATE_STOPPED) R.string.start else R.string.stop)
         modeGroup.isEnabled = state == AudioService.STATE_STOPPED
         findViewById<android.view.View>(R.id.modeMic).isEnabled = state == AudioService.STATE_STOPPED
         findViewById<android.view.View>(R.id.modeSpeaker).isEnabled = state == AudioService.STATE_STOPPED
         ipField.isEnabled = state == AudioService.STATE_STOPPED
+        qrButton.isEnabled = state == AudioService.STATE_STOPPED
+        scanButton.isEnabled = state == AudioService.STATE_STOPPED && !scanning
         if (state != AudioService.STATE_STOPPED && prefs.getBoolean("screenOn", false)) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
@@ -157,8 +193,84 @@ class MainActivity : AppCompatActivity() {
             .setAction(AudioService.ACTION_START)
             .putExtra("ip", ip).putExtra("port", port).putExtra("mode", mode)
             .putExtra("source", source)
+            .putExtra("opus", prefs.getString("codec", "0") == "1")
+            .putExtra("reconnect", prefs.getBoolean("autoReconnect", true))
+            .putExtra("aec", prefs.getBoolean("aec", false))
+            .putExtra("ns", prefs.getBoolean("ns", false))
             .putExtra("autoMute", prefs.getBoolean("autoMute", false))
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        askBatteryOnce()
+    }
+
+    /** Pergunta uma vez se pode ignorar a otimização de bateria (evita o Android matar o áudio). */
+    private fun askBatteryOnce() {
+        if (prefs.getBoolean("batteryAsked", false)) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        prefs.edit().putBoolean("batteryAsked", true).apply()
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.battery_title)
+            .setMessage(R.string.battery_message)
+            .setPositiveButton(R.string.allow) { _, _ -> requestIgnoreBattery(this) }
+            .setNegativeButton(R.string.not_now, null)
+            .show()
+    }
+
+    // ---- descoberta automática e QR code
+    private fun applyHost(ip: String, port: Int) {
+        ipField.setText(ip)
+        prefs.edit().putString("ip", ip).putString("port", port.toString()).apply()
+    }
+
+    private fun searchPcs(silent: Boolean) {
+        if (scanning || AudioService.state != AudioService.STATE_STOPPED) return
+        scanning = true
+        scanButton.isEnabled = false
+        scanButton.setText(R.string.searching)
+        Thread {
+            val found = try { DiscoveryClient.scan() } catch (_: Exception) { emptyList() }
+            runOnUiThread { onScanResult(found, silent) }
+        }.start()
+    }
+
+    private fun onScanResult(found: List<DiscoveryClient.Host>, silent: Boolean) {
+        scanning = false
+        scanButton.setText(R.string.find_pc)
+        scanButton.isEnabled = AudioService.state == AudioService.STATE_STOPPED
+        if (found.isEmpty()) {
+            if (!silent) Toast.makeText(this, R.string.no_pc_found, Toast.LENGTH_LONG).show()
+        } else if (found.size == 1) {
+            applyHost(found[0].ip, found[0].port)
+        } else {
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.choose_pc)
+                .setItems(found.map { "${it.name} (${it.ip})" }.toTypedArray()) { _, i ->
+                    applyHost(found[i].ip, found[i].port)
+                }
+                .show()
+        }
+    }
+
+    private fun scanQr() {
+        scanLauncher.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt(getString(R.string.qr_prompt))
+                .setBeepEnabled(false)
+                .setOrientationLocked(false)
+        )
+    }
+
+    /** Formato do QR: phonebridge://IP:PORTA */
+    private fun handleQr(text: String) {
+        val uri = try { Uri.parse(text.trim()) } catch (_: Exception) { null }
+        val host = uri?.host
+        if (uri == null || uri.scheme != "phonebridge" || host.isNullOrEmpty()) {
+            Toast.makeText(this, R.string.qr_invalid, Toast.LENGTH_LONG).show()
+            return
+        }
+        applyHost(host, if (uri.port > 0) uri.port else 5800)
+        if (AudioService.state == AudioService.STATE_STOPPED) toggle() // um toque só: lê o QR e já conecta
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {

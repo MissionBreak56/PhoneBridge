@@ -57,6 +57,30 @@
                 android:inputType="textUri" />
         </com.google.android.material.textfield.TextInputLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/scanButton"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/find_pc" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/qrButton"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/qr_code" />
+        </LinearLayout>
+
         <com.google.android.material.button.MaterialButton
             android:id="@+id/mainButton"
             android:layout_width="wrap_content"
