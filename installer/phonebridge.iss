@@ -16,7 +16,7 @@ OutputBaseFilename=PhoneBridgeSetup
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
-ArchitecturesInstallMode=x64compatible
+ArchitecturesInstallIn64BitMode=x64
 WizardStyle=modern
 
 [Languages]

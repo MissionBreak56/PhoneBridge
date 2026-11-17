@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         working-directory: pc
         run: |
-          pyinstaller --onefile --noconsole --icon icon.ico --name PhoneBridgeServer --hidden-import pystray._win32 --add-binary "opus.dll;." server.py
+          pyinstaller --onefile --noconsole --icon icon.ico --name PhoneBridgeServer --hidden-import pystray._win32 --hidden-import PIL._tkinter_finder --add-binary "opus.dll;." server.py
       - name: Teste de fumaça do .exe (abre e continua rodando)
         shell: pwsh
         run: |
@@ -98,7 +98,7 @@ jobs:
         working-directory: pc
         run: |
           . .venv/bin/activate
-          pyinstaller --onefile --name PhoneBridgeServer-linux --add-binary "/usr/lib/x86_64-linux-gnu/libopus.so.0:." server.py
+          pyinstaller --onefile --name PhoneBridgeServer-linux --hidden-import PIL._tkinter_finder --add-binary "/usr/lib/x86_64-linux-gnu/libopus.so.0:." server.py
       - name: Teste de fumaça (abre e continua rodando)
         working-directory: pc
         run: |
