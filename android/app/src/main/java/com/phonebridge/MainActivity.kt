@@ -257,7 +257,8 @@ class MainActivity : AppCompatActivity() {
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                 .setPrompt(getString(R.string.qr_prompt))
                 .setBeepEnabled(false)
-                .setOrientationLocked(false)
+                .setCaptureActivity(PortraitCaptureActivity::class.java)
+                .setOrientationLocked(true)
         )
     }
 
