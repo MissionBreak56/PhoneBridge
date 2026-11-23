@@ -11,13 +11,26 @@ android {
         applicationId = "com.phonebridge"
         minSdk = 24
         targetSdk = 34
-        versionCode = 5
-        versionName = "2.0.1"
+        versionCode = 6
+        versionName = "3.0.0"
     }
 
+    // Assinatura de release: vem de variáveis de ambiente (GitHub Secrets no CI). Nada de senha ou keystore no código.
+    val keystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")
+    signingConfigs {
+        create("release") {
+            if (!keystorePath.isNullOrEmpty()) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (!keystorePath.isNullOrEmpty()) signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
@@ -35,4 +48,5 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.preference:preference-ktx:1.2.1")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0") // leitor de QR code
+    testImplementation("junit:junit:4.13.2")
 }

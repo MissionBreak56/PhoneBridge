@@ -10,7 +10,7 @@ object DiscoveryClient {
     private const val PORT = 5801
     private val REQUEST = "PBFIND1".toByteArray(Charsets.US_ASCII)
 
-    data class Host(val name: String, val ip: String, val port: Int, val opus: Boolean)
+    data class Host(val name: String, val ip: String, val port: Int, val opus: Boolean, val pcid: String = "")
 
     fun scan(timeoutMs: Int = 1500): List<Host> {
         val found = LinkedHashMap<String, Host>()
@@ -42,12 +42,12 @@ object DiscoveryClient {
         return found.values.toList()
     }
 
-    /** "PBHERE1|nome|porta|opus" */
+    /** "PBHERE1|nome|porta|opus|proto|pcid" (os dois últimos só existem a partir da versão 3 do PC) */
     internal fun parse(text: String, ip: String): Host? {
         val p = text.split("|")
         if (p.size < 4 || p[0] != "PBHERE1") return null
         val port = p[2].toIntOrNull() ?: return null
-        return Host(p[1], ip, port, p[3] == "1")
+        return Host(p[1], ip, port, p[3] == "1", if (p.size >= 6) p[5] else "")
     }
 
     private fun broadcastAddresses(): List<InetAddress> {

@@ -55,6 +55,22 @@
         <item>Sem compressão (PCM)</item>
         <item>Opus (usa menos Wi-Fi, experimental)</item>
     </string-array>
+    <string name="not_paired">Este PC ainda não foi pareado. Toque em QR code e leia o código mostrado pelo PhoneBridge no PC.</string>
+    <string name="not_paired_tag">(não pareado)</string>
+    <string name="found_not_paired">PC encontrado, mas ainda não pareado. Toque em QR code para parear.</string>
+    <string name="auth_failed">O PC recusou este celular. Pareie de novo com o QR code (o pareamento pode ter sido removido no PC).</string>
+    <string name="pc_version_unsupported">O PC usa uma versão incompatível do PhoneBridge. Atualize os dois apps.</string>
+    <string name="pc_busy">Outro celular já está usando este modo no PC</string>
+    <string name="pc_requires_pairing">O PC exige pareamento (conexão segura). Atualize este app e pareie com o QR code.</string>
+    <string name="qr_old">Este QR code é de uma versão antiga do PhoneBridge no PC. Atualize o app do PC para parear.</string>
+    <string name="pairing_saved">Pareado com %1$s</string>
+    <string name="pref_legacy">Permitir PCs antigos sem proteção</string>
+    <string name="pref_legacy_summary">Inseguro: sem senha nem criptografia. Só para PCs que não podem ser atualizados.</string>
+    <string name="pref_paired">PCs pareados</string>
+    <string name="pref_paired_summary">Ver e remover PCs pareados</string>
+    <string name="no_paired">Nenhum PC pareado ainda</string>
+    <string name="forget">Remover</string>
+    <string name="forget_confirm">Remover o pareamento com %1$s? Será preciso ler o QR code dele de novo.</string>
     <string-array name="audio_source_entries">
         <item>Padrão</item>
         <item>Microfone</item>

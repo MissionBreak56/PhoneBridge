@@ -35,6 +35,15 @@
         app:summary="@string/pref_ns_summary"
         app:title="@string/pref_ns" />
     <Preference
+        app:key="paired"
+        app:summary="@string/pref_paired_summary"
+        app:title="@string/pref_paired" />
+    <SwitchPreferenceCompat
+        app:defaultValue="false"
+        app:key="allowLegacy"
+        app:summary="@string/pref_legacy_summary"
+        app:title="@string/pref_legacy" />
+    <Preference
         app:key="battery"
         app:summary="@string/pref_battery_summary"
         app:title="@string/pref_battery" />

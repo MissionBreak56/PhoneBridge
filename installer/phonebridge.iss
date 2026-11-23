@@ -1,6 +1,6 @@
 ; Instalador do PhoneBridge (Windows) - compilado no CI com Inno Setup.
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "3.0.0"
 #endif
 
 [Setup]
@@ -18,14 +18,17 @@ SolidCompression=yes
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Criar um atalho na área de trabalho"; Flags: unchecked
-Name: "autostart"; Description: "Iniciar o PhoneBridge com o Windows (fica na bandeja)"
-Name: "network"; Description: "Liberar no Firewall e definir as redes conectadas como Privadas"
+Name: "autostart"; Description: "Iniciar o PhoneBridge com o Windows (fica na bandeja)"; Flags: unchecked
+Name: "firewall"; Description: "Criar as regras do Firewall do Windows (somente rede local)"
+Name: "privatenet"; Description: "Mudar as redes conectadas de Pública para Privada (só em redes de confiança)"; Flags: unchecked
 
 [Files]
 Source: "..\pc\dist\PhoneBridgeServer.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -41,9 +44,12 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\setup-network.ps1"""; \
-  Flags: runhidden; StatusMsg: "Configurando o Firewall e as redes..."; Tasks: network
+  Flags: runhidden; StatusMsg: "Criando as regras do Firewall..."; Tasks: firewall
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\setup-network.ps1"" -Private"; \
+  Flags: runhidden; StatusMsg: "Ajustando as redes..."; Tasks: privatenet
 Filename: "{app}\PhoneBridgeServer.exe"; Description: "Abrir o PhoneBridge"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-NetFirewallRule -DisplayName 'PhoneBridge*' | Remove-NetFirewallRule"""; \
+; remove somente as regras com os nomes do PhoneBridge; as configurações e os celulares pareados (AppData) ficam
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\setup-network.ps1"" -RemoveOnly"; \
   Flags: runhidden; RunOnceId: "RemoveFirewallRules"

@@ -5,6 +5,7 @@ import android.text.InputType
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceFragmentCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 
 class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -28,6 +29,10 @@ class SettingsActivity : AppCompatActivity() {
             findPreference<EditTextPreference>("port")?.setOnBindEditTextListener {
                 it.inputType = InputType.TYPE_CLASS_NUMBER
             }
+            findPreference<androidx.preference.Preference>("paired")?.setOnPreferenceClickListener {
+                showPaired()
+                true
+            }
             findPreference<androidx.preference.Preference>("battery")?.setOnPreferenceClickListener {
                 activity?.let { a -> MainActivity.requestIgnoreBattery(a) }
                 true
@@ -36,6 +41,30 @@ class SettingsActivity : AppCompatActivity() {
                 MainActivity.applyTheme(v as String)
                 true
             }
+        }
+
+        /** Lista os PCs pareados; tocar em um pergunta se quer remover o pareamento. */
+        private fun showPaired() {
+            val ctx = context ?: return
+            val store = PairingStore(ctx)
+            val list = store.all()
+            if (list.isEmpty()) {
+                MaterialAlertDialogBuilder(ctx).setTitle(R.string.pref_paired).setMessage(R.string.no_paired)
+                    .setPositiveButton(android.R.string.ok, null).show()
+                return
+            }
+            MaterialAlertDialogBuilder(ctx)
+                .setTitle(R.string.pref_paired)
+                .setItems(list.map { "${it.name} (${it.host})" }.toTypedArray()) { _, i ->
+                    val pc = list[i]
+                    MaterialAlertDialogBuilder(ctx)
+                        .setMessage(getString(R.string.forget_confirm, pc.name))
+                        .setPositiveButton(R.string.forget) { _, _ -> store.remove(pc.pcid) }
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .show()
+                }
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
         }
     }
 }

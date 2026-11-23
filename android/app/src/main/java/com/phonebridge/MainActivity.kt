@@ -28,6 +28,8 @@ import android.widget.TextView
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        private const val REQ_PERMISSIONS = 10
+
         /** Abre a tela do Android que permite ignorar a otimização de bateria deste app. */
         fun requestIgnoreBattery(a: android.app.Activity) {
             try {
@@ -60,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scanButton: MaterialButton
     private lateinit var qrButton: MaterialButton
     private var scanning = false
+    private lateinit var pairings: PairingStore
 
     private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
         val text = result.contents ?: return@registerForActivityResult
@@ -80,6 +83,7 @@ class MainActivity : AppCompatActivity() {
         muteSwitch = findViewById(R.id.muteSwitch)
         levelText = findViewById(R.id.levelText)
         levelSeek = findViewById(R.id.levelSeek)
+        pairings = PairingStore(this)
         scanButton = findViewById(R.id.scanButton)
         qrButton = findViewById(R.id.qrButton)
 
@@ -155,16 +159,21 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val needed = mutableListOf<String>()
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        // o microfone só é necessário no modo microfone; no modo alto-falante o celular só toca o som do PC
+        if (currentMode() == 1 &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+        ) {
             needed += Manifest.permission.RECORD_AUDIO
         }
         if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !prefs.getBoolean("notifAsked", false)
         ) {
             needed += Manifest.permission.POST_NOTIFICATIONS
+            prefs.edit().putBoolean("notifAsked", true).apply()
         }
         if (needed.isNotEmpty()) {
-            requestPermissions(needed.toTypedArray(), 10)
+            requestPermissions(needed.toTypedArray(), REQ_PERMISSIONS)
             return
         }
         start()
@@ -172,11 +181,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            start()
-        } else {
-            AudioService.setError(getString(R.string.perm_denied))
-        }
+        if (code != REQ_PERMISSIONS) return
+        // negar as notificações não impede o áudio (o serviço continua em primeiro plano); negar o microfone impede o modo microfone
+        val micDenied = currentMode() == 1 &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+        if (micDenied) AudioService.setError(getString(R.string.perm_denied)) else start()
     }
 
     private fun start() {
@@ -185,7 +194,14 @@ class MainActivity : AppCompatActivity() {
             AudioService.setError(getString(R.string.enter_ip))
             return
         }
-        val port = prefs.getString("port", "5800")?.toIntOrNull() ?: 5800
+        var port = prefs.getString("port", "5800")?.toIntOrNull() ?: 5800
+        val paired = pairings.findByHost(ip)
+        val allowLegacy = prefs.getBoolean("allowLegacy", false)
+        if (paired == null && !allowLegacy) {
+            AudioService.setError(getString(R.string.not_paired))
+            return
+        }
+        if (paired != null) port = paired.port
         val mode = currentMode()
         val source = prefs.getString("audioSource", "0")?.toIntOrNull() ?: 0
         prefs.edit().putString("ip", ip).putInt("mode", mode).apply()
@@ -198,6 +214,8 @@ class MainActivity : AppCompatActivity() {
             .putExtra("aec", prefs.getBoolean("aec", false))
             .putExtra("ns", prefs.getBoolean("ns", false))
             .putExtra("autoMute", prefs.getBoolean("autoMute", false))
+            .putExtra("pcid", paired?.pcid)
+            .putExtra("allowLegacy", allowLegacy)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
         askBatteryOnce()
     }
@@ -239,14 +257,26 @@ class MainActivity : AppCompatActivity() {
         scanButton.isEnabled = AudioService.state == AudioService.STATE_STOPPED
         if (found.isEmpty()) {
             if (!silent) Toast.makeText(this, R.string.no_pc_found, Toast.LENGTH_LONG).show()
-        } else if (found.size == 1) {
-            applyHost(found[0].ip, found[0].port)
+            return
+        }
+        // se o PC é um dos pareados, atualiza o endereço dele (o IP pode ter mudado)
+        fun use(h: DiscoveryClient.Host) {
+            if (h.pcid.isNotEmpty()) pairings.touch(h.pcid, h.ip, h.port)
+            applyHost(h.ip, h.port)
+            if (pairings.findByHost(h.ip) == null && !silent) {
+                Toast.makeText(this, R.string.found_not_paired, Toast.LENGTH_LONG).show()
+            }
+        }
+        if (found.size == 1) {
+            use(found[0])
         } else {
+            val labels = found.map {
+                val tag = if (it.pcid.isNotEmpty() && pairings.findByPcid(it.pcid) != null) "" else " " + getString(R.string.not_paired_tag)
+                "${it.name} (${it.ip})$tag"
+            }
             MaterialAlertDialogBuilder(this)
                 .setTitle(R.string.choose_pc)
-                .setItems(found.map { "${it.name} (${it.ip})" }.toTypedArray()) { _, i ->
-                    applyHost(found[i].ip, found[i].port)
-                }
+                .setItems(labels.toTypedArray()) { _, i -> use(found[i]) }
                 .show()
         }
     }
@@ -262,28 +292,17 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** Formato do QR: phonebridge://IP:PORTA */
+    /** QR de pareamento: phonebridge://IP:PORTA?v=3&id=...&pid=...&k=...&n=... (veja PROTOCOL.md). */
     private fun handleQr(text: String) {
-        val uri = try { Uri.parse(text.trim()) } catch (_: Exception) { null }
-        val host = uri?.host
-        if (uri == null || uri.scheme != "phonebridge" || host.isNullOrEmpty()) {
-            Toast.makeText(this, R.string.qr_invalid, Toast.LENGTH_LONG).show()
+        val link = PairingLink.parse(text)
+        if (link == null) {
+            val legacyQr = text.trim().startsWith("phonebridge://")
+            Toast.makeText(this, if (legacyQr) R.string.qr_old else R.string.qr_invalid, Toast.LENGTH_LONG).show()
             return
         }
-        applyHost(host, if (uri.port > 0) uri.port else 5800)
+        pairings.save(PairedPc(link.pcid, link.name, link.host, link.port, link.pid, link.secret, System.currentTimeMillis()))
+        applyHost(link.host, link.port)
+        Toast.makeText(this, getString(R.string.pairing_saved, link.name), Toast.LENGTH_LONG).show()
         if (AudioService.state == AudioService.STATE_STOPPED) toggle() // um toque só: lê o QR e já conecta
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menuInflater.inflate(R.menu.main_menu, menu)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == R.id.action_settings) {
-            startActivity(Intent(this, SettingsActivity::class.java))
-            return true
-        }
-        return super.onOptionsItemSelected(item)
     }
 }

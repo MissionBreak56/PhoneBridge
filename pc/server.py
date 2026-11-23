@@ -30,12 +30,15 @@ except Exception:  # noqa: BLE001 - alguns desktops Linux não têm backend de b
     except Exception:  # noqa: BLE001
         pystray = None
 
+import diagnostics
 import protocol as pr
+import recorder
+import security as sec
 import sysutil
+import updater
 from audio_backend import IS_WIN, create_backend
 from engine import BridgeServer
-
-APP_VERSION = "2.0.0"
+from version import APP_VERSION
 DEFAULT_PORT = pr.DEFAULT_PORT
 SINGLE_PORT = 47653  # trava local para permitir só uma janela aberta
 
@@ -152,11 +155,15 @@ class App:
         self.net_busy = False
         self.qr_win = None
         self.asked_this_session = False
+        self.fw_unknown_logged = False
+        self.registry = sec.DeviceRegistry(os.path.join(CONFIG_DIR, "devices.json"))
+        self.limiter = sec.AuthLimiter()
+        self.devices_win = None
 
         root.title("PhoneBridge")
         self._win_job = None
         self._restore_window()
-        root.minsize(400, 760)
+        root.minsize(400, 680)
         root.configure(bg=BG)
         self.win_icon = ImageTk.PhotoImage(make_icon(64))
         root.iconphoto(True, self.win_icon)
@@ -206,9 +213,12 @@ class App:
         ips = pr.local_ips()
         tk.Label(wrap, text="   ".join(ips) or "indisponível", bg=BG, fg=TEXT,
                  font=(FONT, 11), justify="left", wraplength=360).pack(anchor="w", pady=(4, 6))
-        qr_btn = FlatButton(wrap, "Mostrar QR code para conectar", self.show_qr, bg=SURFACE, hover=BORDER, fg=TEXT)
-        qr_btn.config(font=(FONT, 9), pady=6)
-        qr_btn.pack(fill="x", pady=(0, 12))
+        pair_row = tk.Frame(wrap, bg=BG)
+        pair_row.pack(fill="x", pady=(0, 12))
+        for txt, cmd in (("Parear celular (QR code)", self.show_pairing), ("Celulares autorizados", self.show_devices)):
+            b = FlatButton(pair_row, txt, cmd, bg=SURFACE, hover=BORDER, fg=TEXT)
+            b.config(font=(FONT, 9), pady=6)
+            b.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         self.btn = FlatButton(wrap, "Iniciar servidor", self.toggle)
         self.btn.pack(fill="x")
@@ -221,13 +231,34 @@ class App:
         self.meter.pack(fill="x", pady=(4, 12))
         self.meter_bar = self.meter.create_rectangle(0, 0, 0, 12, fill=OK, outline="")
 
-        opts = tk.Frame(wrap, bg=BG)
-        opts.pack(anchor="w", pady=(0, 10))
         self.opus_var = tk.BooleanVar(value=bool(self.cfg.get("opus", True)))
-        self._check(opts, "Permitir compressão Opus (se o celular pedir)", self.opus_var, self._opts_changed)
         self.auto_var = tk.BooleanVar(value=sysutil.is_autostart())
-        self._check(opts, "Iniciar com o Windows" if IS_WIN else "Iniciar com o sistema",
-                    self.auto_var, self._autostart_changed)
+        self.legacy_var = tk.BooleanVar(value=bool(self.cfg.get("allow_legacy", False)))
+        self.record_var = tk.BooleanVar(value=False)  # gravação sempre começa desligada
+        self.disc_var = tk.BooleanVar(value=bool(self.cfg.get("discovery", True)))
+        self.upd_var = tk.BooleanVar(value=bool(self.cfg.get("check_updates", True)))
+        more = tk.Menubutton(wrap, text="Mais opções  ▾", bg=SURFACE, fg=TEXT, activebackground=BORDER,
+                             activeforeground=TEXT, relief="flat", font=(FONT, 9), pady=6, cursor="hand2")
+        menu = tk.Menu(more, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=ACCENT, activeforeground="#ffffff")
+        menu.add_checkbutton(label="Permitir compressão Opus (se o celular pedir)", variable=self.opus_var,
+                             command=self._opts_changed)
+        menu.add_checkbutton(label="Iniciar com o Windows" if IS_WIN else "Iniciar com o sistema",
+                             variable=self.auto_var, command=self._autostart_changed)
+        menu.add_checkbutton(label="Gravar o áudio em WAV (Documentos/PhoneBridge)", variable=self.record_var,
+                             command=self._opts_changed)
+        menu.add_checkbutton(label="Responder à busca automática do celular (reiniciar o servidor)",
+                             variable=self.disc_var, command=self._opts_changed)
+        menu.add_checkbutton(label="Verificar atualizações ao abrir", variable=self.upd_var,
+                             command=self._opts_changed)
+        menu.add_separator()
+        menu.add_checkbutton(label="Aceitar apps antigos SEM proteção (inseguro)", variable=self.legacy_var,
+                             command=self._legacy_toggled)
+        menu.add_separator()
+        menu.add_command(label="Verificar atualização agora", command=lambda: self.check_updates(manual=True))
+        menu.add_command(label="Diagnóstico de conexão...", command=self.show_diagnostics)
+        menu.add_command(label="Abrir pasta das gravações", command=self.open_recordings)
+        more.config(menu=menu)
+        more.pack(fill="x", pady=(0, 10))
 
         self._label(wrap, "REGISTRO")
         box = tk.Frame(wrap, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
@@ -244,6 +275,8 @@ class App:
         if IS_WIN:
             root.after(1500, self._net_check_async)
             root.after(60000, self._net_watch)
+        if updater.frozen() and self.cfg.get("check_updates", True):
+            root.after(4000, self.check_updates)
         if lock is not None:
             threading.Thread(target=self._listen_show, args=(lock,), daemon=True).start()
         if start_hidden:
@@ -339,28 +372,134 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- QR code
-    def show_qr(self):
+    # ---- pareamento (QR code) e celulares autorizados
+    def show_pairing(self):
         ip = pr.primary_ip()
         if not ip:
             messagebox.showwarning("PhoneBridge", "Não foi possível descobrir o IP deste PC.", parent=self.root)
             return
+        try:
+            pid, psk = self.registry.create_pairing()
+        except ValueError as e:
+            messagebox.showwarning("PhoneBridge", str(e), parent=self.root)
+            return
+        port = self._cur_port()
+        link = sec.pairing_link(ip, port, self.registry.pcid, pid, psk, socket.gethostname())
         if self.qr_win is not None:
             try:
                 self.qr_win.destroy()
             except tk.TclError:
                 pass
-        payload = pr.qr_payload(ip, self._cur_port())
         win = tk.Toplevel(self.root)
-        win.title("PhoneBridge - QR code")
+        win.title("PhoneBridge - parear celular")
         win.configure(bg=BG)
         win.resizable(False, False)
-        self.qr_photo = ImageTk.PhotoImage(make_qr_image(payload))
+        self.qr_photo = ImageTk.PhotoImage(make_qr_image(link, 320))
         tk.Label(win, image=self.qr_photo, bg="white", bd=0).pack(padx=24, pady=(24, 10))
-        tk.Label(win, text=f"{ip}:{self._cur_port()}", bg=BG, fg=TEXT, font=(FONT, 12, "bold")).pack()
-        tk.Label(win, text="No celular: PhoneBridge > QR code", bg=BG, fg=MUTED_TXT,
-                 font=(FONT, 9)).pack(pady=(2, 20))
+        tk.Label(win, text=f"{ip}:{port}", bg=BG, fg=TEXT, font=(FONT, 12, "bold")).pack()
+        tk.Label(win, text="No celular: PhoneBridge > QR code.\nEste código contém a chave de pareamento: mostre só "
+                 "para o seu celular.\nVale por 10 minutos e só pode ser usado por um aparelho.",
+                 bg=BG, fg=MUTED_TXT, font=(FONT, 9), justify="center").pack(pady=(4, 8))
+
+        def copy():
+            win.clipboard_clear()
+            win.clipboard_append(link)
+            self.log("Link de pareamento copiado (vale por 10 minutos).")
+
+        def close():
+            if not any(d["pid"] == pid and d["active"] for d in self.registry.list_devices()):
+                self.registry.revoke(pid)  # fechou sem usar: o código deixa de valer
+            win.destroy()
+
+        b = FlatButton(win, "Copiar link de pareamento", copy, bg=SURFACE, hover=BORDER, fg=TEXT)
+        b.config(font=(FONT, 9), pady=6)
+        b.pack(padx=24, pady=(0, 20), fill="x")
+        win.protocol("WM_DELETE_WINDOW", close)
         self.qr_win = win
+        self.log("Pareamento criado: leia o QR code no celular em até 10 minutos.")
+
+    def show_devices(self):
+        if self.devices_win is not None:
+            try:
+                self.devices_win.destroy()
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title("Celulares autorizados")
+        win.configure(bg=BG)
+        win.geometry("460x320")
+        self.devices_win = win
+        tk.Label(win, text="Celulares autorizados", bg=BG, fg=TEXT, font=(FONT, 13, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, text="Só eles conseguem conectar. Remover desfaz o pareamento na hora.", bg=BG, fg=MUTED_TXT,
+                 font=(FONT, 9)).pack(anchor="w", padx=16, pady=(0, 8))
+        box = tk.Listbox(win, bg=SURFACE, fg=TEXT, selectbackground=ACCENT, relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground=BORDER, font=(FONT, 10), activestyle="none")
+        box.pack(fill="both", expand=True, padx=16)
+        rows = []
+
+        def refresh():
+            box.delete(0, "end")
+            rows.clear()
+            for d in self.registry.list_devices():
+                seen = time.strftime("%d/%m %H:%M", time.localtime(d["last_seen"])) if d["last_seen"] else "nunca"
+                label = (d["name"] or "(aguardando a primeira conexão)") if d["active"] else "(pareamento pendente)"
+                box.insert("end", f"{label}  -  {d['last_ip'] or '-'}  -  visto: {seen}")
+                rows.append(d["pid"])
+            if not rows:
+                box.insert("end", "Nenhum celular pareado. Use \"Parear celular (QR code)\".")
+
+        def remove():
+            sel = box.curselection()
+            if not sel or sel[0] >= len(rows):
+                return
+            pid = rows[sel[0]]
+            if messagebox.askyesno("PhoneBridge", "Remover este celular? Ele precisará ser pareado de novo.", parent=win):
+                self.registry.revoke(pid)
+                if self.server:
+                    self.server.disconnect_device(pid)
+                self.log("Celular removido da lista de autorizados.")
+                refresh()
+
+        refresh()
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=16, pady=12)
+        for txt, cmd in (("Remover selecionado", remove), ("Atualizar lista", refresh)):
+            b = FlatButton(row, txt, cmd, bg=SURFACE, hover=BORDER, fg=TEXT)
+            b.config(font=(FONT, 9), pady=6)
+            b.pack(side="left", padx=(0, 6))
+
+    def show_diagnostics(self):
+        text = diagnostics.build_report(self._cur_port(), self.backend, self.server, self.registry)
+        win = tk.Toplevel(self.root)
+        win.title("Diagnóstico")
+        win.configure(bg=BG)
+        win.geometry("520x380")
+        box = tk.Text(win, bg=SURFACE, fg=TEXT, relief="flat", font=("Consolas" if IS_WIN else "DejaVu Sans Mono", 9),
+                      wrap="word", padx=10, pady=8)
+        box.insert("1.0", text)
+        box.config(state="disabled")
+        box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+
+        def copy():
+            win.clipboard_clear()
+            win.clipboard_append(text)
+
+        b = FlatButton(win, "Copiar", copy, bg=SURFACE, hover=BORDER, fg=TEXT)
+        b.config(font=(FONT, 9), pady=6)
+        b.pack(padx=12, pady=(0, 12), anchor="e")
+
+    def open_recordings(self):
+        d = self.cfg.get("record_dir") or recorder.default_dir()
+        os.makedirs(d, exist_ok=True)
+        try:
+            if IS_WIN:
+                os.startfile(d)  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(["xdg-open", d], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001
+            self.log(f"Gravações em: {d}")
 
     # ---- bandeja
     def _start_tray(self):
@@ -374,10 +513,10 @@ class App:
                              lambda: self.ui_q.put("mute")),
             pystray.MenuItem(lambda item: "Parar servidor" if self.server else "Iniciar servidor",
                              lambda: self.ui_q.put("toggle")),
-            pystray.MenuItem("Mostrar QR code", lambda: self.ui_q.put("qr")),
+            pystray.MenuItem("Parear celular (QR code)", lambda: self.ui_q.put("qr")),
         ]
         if IS_WIN:
-            items.append(pystray.MenuItem("Liberar no Firewall e redes privadas", lambda: self.ui_q.put("firewall")))
+            items.append(pystray.MenuItem("Firewall e redes (opcional)", lambda: self.ui_q.put("firewall")))
         items += [pystray.Menu.SEPARATOR, pystray.MenuItem("Sair", lambda: self.ui_q.put("quit"))]
         self.tray = pystray.Icon("PhoneBridge", make_icon(64), "PhoneBridge", pystray.Menu(*items))
         try:
@@ -397,13 +536,13 @@ class App:
             return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _restore_window(self):
-        geo = "440x800"
+        geo = "440x720"
         w = self.cfg.get("window")
         if isinstance(w, dict):
             try:
                 vx, vy, vw, vh = self._virtual_screen()
                 ww = max(400, min(int(w["w"]), vw))
-                hh = max(760, min(int(w["h"]), vh))
+                hh = max(680, min(int(w["h"]), vh))
                 x = max(vx, min(int(w["x"]), vx + vw - ww))  # garante que fique dentro de alguma tela
                 y = max(vy, min(int(w["y"]), vy + vh - hh))
                 geo = f"{ww}x{hh}+{x}+{y}"
@@ -440,11 +579,35 @@ class App:
         save_config(self.cfg)
 
     # ---- opções
+    def _record_dir(self):
+        return (self.cfg.get("record_dir") or recorder.default_dir()) if self.record_var.get() else None
+
     def _opts_changed(self):
-        self.cfg["opus"] = bool(self.opus_var.get())
+        self.cfg.update(opus=bool(self.opus_var.get()), discovery=bool(self.disc_var.get()),
+                        check_updates=bool(self.upd_var.get()))
         save_config(self.cfg)
         if self.server:
             self.server.opus_allowed = self.cfg["opus"]
+            self.server.record_dir = self._record_dir()  # vale para as próximas conexões
+        if self.record_var.get():
+            self.log(f"Gravação ligada: vale para as próximas conexões ({self._record_dir()}).")
+
+    def _legacy_toggled(self):
+        if self.legacy_var.get():
+            ok = messagebox.askyesno(
+                "PhoneBridge - modo sem proteção",
+                "Apps antigos (versão 2.x e anteriores) não usam senha nem criptografia: qualquer aparelho da rede "
+                "poderia usar seu microfone ou ouvir o som do PC.\n\nLigue só em rede de confiança e desligue "
+                "depois. O ideal é atualizar o app do celular.\n\nLigar mesmo assim?", icon="warning", parent=self.root)
+            if not ok:
+                self.legacy_var.set(False)
+                return
+        self.cfg["allow_legacy"] = bool(self.legacy_var.get())
+        save_config(self.cfg)
+        if self.server:
+            self.server.allow_legacy = self.cfg["allow_legacy"]
+        self.log("Modo SEM proteção LIGADO para apps antigos." if self.cfg["allow_legacy"]
+                 else "Modo sem proteção desligado: só celulares pareados conectam.")
 
     def _autostart_changed(self):
         ok = sysutil.set_autostart(bool(self.auto_var.get()))
@@ -454,20 +617,12 @@ class App:
         else:
             self.log("Vai iniciar com o sistema." if self.auto_var.get() else "Não vai mais iniciar com o sistema.")
 
-    # ---- firewall e rede privada (Windows)
+    # ---- firewall e rede privada (Windows): cada alteração é opcional e pedida separadamente
     def _cur_port(self):
         try:
             return int(self.port_var.get())
         except ValueError:
             return DEFAULT_PORT
-
-    def _net_needs(self, port):
-        missing = not sysutil.fw_rules_ok(port)
-        pubs = sysutil.public_networks()
-        declined_fw = port in self.cfg.get("fw_declined", [])
-        declined_nets = set(self.cfg.get("net_declined", []))
-        pubs = [n for n in pubs if n not in declined_nets]
-        return (missing and not declined_fw), pubs
 
     def _net_check_async(self, force=False):
         if not IS_WIN or self.net_busy:
@@ -475,12 +630,20 @@ class App:
         port = self._cur_port()
 
         def work():
+            state = sysutil.fw_rules_state(port)
+            pubs = sysutil.public_networks()
             if force:
-                self.ui_q.put(("ask_net", port, not sysutil.fw_rules_ok(port), sysutil.public_networks(), True))
+                self.ui_q.put(("ask_net", port, state, pubs, True))
                 return
-            missing, pubs = self._net_needs(port)
-            if missing or pubs:
-                self.ui_q.put(("ask_net", port, missing, pubs, False))
+            if state == "unknown" and not self.fw_unknown_logged:
+                self.fw_unknown_logged = True
+                self.log("Não foi possível verificar as regras do Firewall. Se o celular não conectar, use o menu da "
+                         "bandeja > Liberar no Firewall.")
+            need_fw = state == "missing" and port not in self.cfg.get("fw_declined", [])
+            declined = set(self.cfg.get("net_declined", []))
+            pubs = [n for n in pubs if n not in declined]
+            if need_fw or pubs:
+                self.ui_q.put(("ask_net", port, state, pubs, False))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -490,56 +653,109 @@ class App:
             self._net_check_async()
         self.root.after(60000, self._net_watch)
 
-    def _ask_net(self, port, missing, pubs, force):
-        if self.net_busy or (not force and self.asked_this_session and not pubs):
+    def _ask_net(self, port, state, pubs, force):
+        if self.net_busy:
             return
-        if not missing and not pubs and not force:
-            return
-        parts = []
-        if missing or force:
-            parts.append(f"• criar regras no Firewall do Windows liberando a porta {port} (TCP) e a porta "
-                         f"{pr.DISCOVERY_PORT} (UDP, descoberta automática) somente para dispositivos da sua rede local")
+        do_fw = do_priv = False
+        if state == "missing" or (force and state != "ok"):
+            do_fw = messagebox.askyesno(
+                "PhoneBridge - Firewall",
+                f"Para o celular conectar, o PhoneBridge pode criar duas regras de entrada no Firewall do Windows: "
+                f"porta {port} (TCP, áudio) e porta {pr.DISCOVERY_PORT} (UDP, busca automática), ambas só para "
+                "dispositivos da sua rede local.\n\nO Windows vai pedir permissão de administrador. Criar as regras?",
+                parent=self.root)
+            if not do_fw and not force:
+                self.cfg.setdefault("fw_declined", []).append(port)
         if pubs:
-            parts.append("• mudar para \"Privada\" as redes conectadas agora que estão como \"Pública\": "
-                         + ", ".join(pubs))
-        if not parts:
-            self.log("Firewall e redes já estão configurados.")
-            return
-        ok = messagebox.askyesno(
-            "PhoneBridge - Rede e Firewall",
-            "Para o celular conseguir conectar neste PC, o PhoneBridge pode:\n\n" + "\n".join(parts) +
-            "\n\nO Windows vai pedir permissão de administrador. Aplicar agora?",
-            parent=self.root,
-        )
-        self.asked_this_session = True
-        if not ok:
-            if missing and port not in self.cfg.setdefault("fw_declined", []):
-                self.cfg["fw_declined"].append(port)
-            nd = self.cfg.setdefault("net_declined", [])
-            nd.extend(n for n in pubs if n not in nd)
-            save_config(self.cfg)
-            self.log("Rede/Firewall: nada foi alterado. Use o menu da bandeja > \"Liberar no Firewall e redes "
-                     "privadas\" se o celular não conseguir conectar.")
-            return
-        if port in self.cfg.get("fw_declined", []):
-            self.cfg["fw_declined"].remove(port)
-        self.cfg["net_declined"] = []
+            do_priv = messagebox.askyesno(
+                "PhoneBridge - Rede",
+                "Estas redes conectadas estão como \"Pública\": " + ", ".join(pubs) + ".\n\nNo Windows, redes "
+                "Públicas bloqueiam a conexão do celular. Mudar para \"Privada\" deixa o PC visível nessas redes e "
+                "libera mais recursos de compartilhamento: faça isso só em redes de confiança (casa, trabalho).\n\n"
+                "Mudar estas redes para Privada?", icon="warning", parent=self.root)
+            if not do_priv:
+                nd = self.cfg.setdefault("net_declined", [])
+                nd.extend(n for n in pubs if n not in nd)
         save_config(self.cfg)
+        if not (do_fw or do_priv):
+            if force and state == "ok" and not pubs:
+                self.log("Firewall e redes já estão configurados.")
+            else:
+                self.log("Rede/Firewall: nada foi alterado. Use o menu da bandeja se o celular não conseguir conectar.")
+            return
+        if do_fw and port in self.cfg.get("fw_declined", []):
+            self.cfg["fw_declined"].remove(port)
         self.net_busy = True
         self.log("Rede/Firewall: aguardando a permissão de administrador...")
-        threading.Thread(target=self._net_apply, args=(port,), daemon=True).start()
+        threading.Thread(target=self._net_apply, args=(port, do_fw, do_priv), daemon=True).start()
 
-    def _net_apply(self, port):
+    def _net_apply(self, port, fw, priv):
         done = False
-        if sysutil.setup_network_elevated(port):
+        if sysutil.setup_network_elevated(port, firewall=fw, private=priv):
             for _ in range(30):
                 time.sleep(1)
-                if sysutil.fw_rules_ok(port) and not sysutil.public_networks():
+                if (not fw or sysutil.fw_rules_state(port) == "ok") and (not priv or not sysutil.public_networks()):
                     done = True
                     break
-        self.log("Rede/Firewall: regras criadas e redes conectadas definidas como Privadas." if done
-                 else "Rede/Firewall: não foi possível concluir (permissão negada ou rede ainda Pública).")
+        self.log("Rede/Firewall: alterações aplicadas." if done
+                 else "Rede/Firewall: não foi possível concluir (permissão negada ou nada mudou).")
         self.net_busy = False
+
+    # ---- atualizações (GitHub Releases, com assinatura e SHA-256)
+    def check_updates(self, manual=False):
+        def work():
+            try:
+                rel = updater.check()
+            except updater.UpdateError as e:
+                if manual:
+                    self.log(f"Atualização: {e}")
+                return
+            self.ui_q.put(("update", rel, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, rel, manual):
+        if rel is None:
+            if manual:
+                messagebox.showinfo("PhoneBridge", f"Você já está na versão mais recente ({APP_VERSION}).",
+                                    parent=self.root)
+            return
+        asset = updater.pick_asset(rel)
+        notes = rel["notes"].strip()[:700]
+        msg = f"Nova versão disponível: {rel['tag']} (instalada: {APP_VERSION}).\n\n{notes}\n\n"
+        if asset is None or not updater.UPDATE_PUBLIC_KEY:
+            if messagebox.askyesno("PhoneBridge - atualização", msg + "Abrir a página da versão para baixar?",
+                                   parent=self.root):
+                webbrowser.open(rel["url"] or f"https://github.com/{updater.REPO}/releases/latest")
+            return
+        if not messagebox.askyesno("PhoneBridge - atualização", msg + "Baixar e verificar agora? (a assinatura e o "
+                                   "SHA-256 são conferidos antes de qualquer instalação)", parent=self.root):
+            return
+        self.log(f"Baixando {asset}...")
+
+        def work():
+            try:
+                path = updater.download_verified(rel, asset)
+            except updater.UpdateError as e:
+                self.ui_q.put(("update_done", None, str(e)))
+                return
+            self.ui_q.put(("update_done", path, ""))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_done(self, path, error):
+        if not path:
+            self.log(f"Atualização recusada: {error}")
+            messagebox.showerror("PhoneBridge", f"Não foi possível atualizar:\n{error}", parent=self.root)
+            return
+        self.log("Atualização verificada (assinatura e SHA-256 conferem).")
+        if updater.launch_installer(path):
+            messagebox.showinfo("PhoneBridge", "Atualização verificada. O instalador foi aberto; o PhoneBridge "
+                                "vai fechar para ser atualizado.", parent=self.root)
+            self.quit()
+        else:
+            messagebox.showinfo("PhoneBridge", f"Atualização verificada e salva em:\n{path}\n\nExtraia e substitua "
+                                "o programa.", parent=self.root)
 
     # ---- janela
     def show(self):
@@ -573,6 +789,10 @@ class App:
             act = self.ui_q.get()
             if isinstance(act, tuple) and act[0] == "ask_net":
                 self._ask_net(*act[1:])
+            elif isinstance(act, tuple) and act[0] == "update":
+                self._show_update(*act[1:])
+            elif isinstance(act, tuple) and act[0] == "update_done":
+                self._update_done(*act[1:])
             elif act == "show":
                 self.show()
             elif act == "mute":
@@ -581,7 +801,7 @@ class App:
                 self.toggle()
             elif act == "qr":
                 self.show()
-                self.show_qr()
+                self.show_pairing()
             elif act == "firewall":
                 self._net_check_async(force=True)
             elif act == "quit":
@@ -598,7 +818,8 @@ class App:
         self.level_disp = max(lvl, self.level_disp * 0.8)
         w = self.meter.winfo_width()
         self.meter.coords(self.meter_bar, 0, 0, w * self.level_disp, 12)
-        self.meter.itemconfig(self.meter_bar, fill=DANGER if self.level_disp > 0.92 else OK)
+        clipping = bool(self.server) and time.time() - self.server.clip_ts < 1.0
+        self.meter.itemconfig(self.meter_bar, fill=DANGER if (self.level_disp > 0.92 or clipping) else OK)
 
     def update_status(self):
         if not self.server:
@@ -643,7 +864,10 @@ class App:
             return
         idx = next((i for i, n in self.devices if n == self.dev_var.get()), None)
         try:
-            self.server = BridgeServer(port, idx, self.log, self.backend, self.opus_var.get())
+            self.server = BridgeServer(
+                port, idx, self.log, self.backend, self.opus_var.get(), registry=self.registry,
+                allow_legacy=bool(self.cfg.get("allow_legacy", False)), limiter=self.limiter,
+                discovery_enabled=bool(self.disc_var.get()), record_dir=self._record_dir())
             self.server.muted = self.muted
             self.server.start()
             if not self.backend.virtual_mic_ready():

@@ -6,10 +6,42 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Versão da release (ex.: v2.0.0); vazio = só compilar"
+        description: "Versão da release (ex.: v3.0.0); vazio = só compilar e testar"
         required: false
 
+permissions:
+  contents: read
+
+env:
+  # SHA-256 do certificado de release do app Android (público): o CI recusa APK assinado com outra chave
+  EXPECTED_APK_CERT_SHA256: "67c057bb6382db6c3faa3c3b40e3a8fdec2ea42daeacfd059231c331e8084813"
+
 jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Ruff (erros de sintaxe e nomes indefinidos)
+        run: |
+          pip install ruff
+          ruff check pc --select E9,F63,F7,F82
+      - name: Vulnerabilidades conhecidas nas dependências (pip-audit)
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r pc/requirements.txt
+      - name: Confere o hash do pacote do VB-Cable (aviso, não bloqueia)
+        run: |
+          pinned=$(grep -E '^VBCABLE_SHA256' pc/sysutil.py | sed -E 's/.*"([0-9a-f]*)".*/\1/')
+          curl -fsSL -o /tmp/vb.zip https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip || { echo "::warning title=VB-Cable::não foi possível baixar o pacote"; exit 0; }
+          actual=$(sha256sum /tmp/vb.zip | cut -d' ' -f1)
+          echo "::notice title=VB-Cable SHA-256::$actual"
+          if [ -z "$pinned" ]; then echo "::warning title=VB-Cable::hash ainda não configurado em sysutil.py"; 
+          elif [ "$pinned" != "$actual" ]; then echo "::warning title=VB-Cable::o pacote mudou (hash diferente do configurado)"; fi
+
   android:
     runs-on: ubuntu-latest
     steps:
@@ -21,14 +53,38 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
-      - name: Build debug APK
+      - name: Testes unitários e APK de depuração
         working-directory: android
         run: |
-          gradle assembleDebug --no-daemon --stacktrace > /tmp/out.txt 2>&1 || { bash ../.github/ci-fail.sh "Android build" /tmp/out.txt; exit 1; }
+          gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace > /tmp/out.txt 2>&1 || { bash ../.github/ci-fail.sh "Android build/testes" /tmp/out.txt; exit 1; }
+      - name: APK de release assinado (chave guardada nos GitHub Secrets)
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        working-directory: android
+        run: |
+          if [ -z "$KS_B64" ]; then
+            echo "::warning title=Assinatura::sem keystore nos Secrets: APK de release NÃO gerado"
+            exit 0
+          fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          gradle assembleRelease --no-daemon --stacktrace > /tmp/rel.txt 2>&1 || { bash ../.github/ci-fail.sh "Android release" /tmp/rel.txt; rm -f "$ANDROID_KEYSTORE_PATH"; exit 1; }
+          rm -f "$ANDROID_KEYSTORE_PATH"
+          apk=app/build/outputs/apk/release/app-release.apk
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$apksigner" verify --print-certs "$apk" | tee /tmp/cert.txt
+          grep -qi "SHA-256 digest: $EXPECTED_APK_CERT_SHA256" /tmp/cert.txt || { echo "::error title=Assinatura::o APK não está assinado com o certificado esperado"; exit 1; }
+          cp "$apk" app/build/outputs/apk/release/PhoneBridge-android.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: PhoneBridge-android-apk
-          path: android/app/build/outputs/apk/debug/*.apk
+          name: PhoneBridge-android
+          path: |
+            android/app/build/outputs/apk/release/PhoneBridge-android.apk
+            android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
 
   pc-windows:
     runs-on: windows-latest
@@ -42,15 +98,15 @@ jobs:
         run: |
           vcpkg install opus:x64-windows
           $bin = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows\bin"
-          Get-ChildItem $bin
           Copy-Item (Join-Path $bin "opus.dll") pc\opus.dll
       - name: Dependências e testes
         shell: pwsh
         working-directory: pc
         run: |
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller pytest
           $env:PATH = "$PWD;$env:PATH"
-          python tests/test_engine.py
+          python -m pytest tests -q 2>&1 | Tee-Object -FilePath $env:RUNNER_TEMP\pytest.txt
+          if ($LASTEXITCODE -ne 0) { bash ../.github/ci-fail.sh "pytest (Windows)" $env:RUNNER_TEMP\pytest.txt; exit 1 }
       - name: Gerar o PhoneBridgeServer.exe
         shell: pwsh
         working-directory: pc
@@ -69,7 +125,7 @@ jobs:
           $log = "$env:RUNNER_TEMP\inno.txt"
           choco install innosetup -y --no-progress *> $log
           $v = "${{ inputs.version }}".TrimStart('v')
-          if (-not $v) { $v = "2.0.0" }
+          if (-not $v) { $v = "3.0.0" }
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" installer\phonebridge.iss *>> $log
           if ($LASTEXITCODE -ne 0) { bash .github/ci-fail.sh "Inno Setup" $log; exit 1 }
       - uses: actions/upload-artifact@v4
@@ -92,8 +148,9 @@ jobs:
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
-          pip install -r requirements.txt pyinstaller
-          python tests/test_engine.py
+          pip install -r requirements.txt pyinstaller pytest
+          python -m pytest tests -q > /tmp/pytest.txt 2>&1 || { cat /tmp/pytest.txt | tail -40; bash ../.github/ci-fail.sh "pytest (Linux)" /tmp/pytest.txt; exit 1; }
+          tail -3 /tmp/pytest.txt
       - name: Gerar o binário
         working-directory: pc
         run: |
@@ -111,7 +168,7 @@ jobs:
         run: |
           mkdir -p out/PhoneBridge-linux
           cp pc/dist/PhoneBridgeServer-linux out/PhoneBridge-linux/
-          cp README.md PROTOCOL.md out/PhoneBridge-linux/
+          cp README.md PROTOCOL.md CHANGELOG.md out/PhoneBridge-linux/
           tar -C out -czf PhoneBridgeServer-linux.tar.gz PhoneBridge-linux
       - uses: actions/upload-artifact@v4
         with:
@@ -120,41 +177,66 @@ jobs:
 
   release:
     if: github.event_name == 'workflow_dispatch' && inputs.version != ''
-    needs: [android, pc-windows, pc-linux]
+    needs: [quality, android, pc-windows, pc-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Publish release
+      - name: Reunir os arquivos
+        run: |
+          mkdir release
+          find dist -type f
+          cp "$(find dist -name PhoneBridge-android.apk | head -1)" release/PhoneBridge-android.apk
+          cp "$(find dist -name PhoneBridgeSetup.exe | head -1)" release/PhoneBridgeSetup.exe
+          cp "$(find dist -name PhoneBridgeServer.exe | head -1)" release/PhoneBridgeServer.exe
+          cp "$(find dist -name PhoneBridgeServer-linux.tar.gz | head -1)" release/PhoneBridgeServer-linux.tar.gz
+      - name: Hashes SHA-256 e assinatura da lista
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          pip install cryptography
+          cd release
+          sha256sum PhoneBridge-android.apk PhoneBridgeSetup.exe PhoneBridgeServer.exe PhoneBridgeServer-linux.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          python - <<'PY'
+          import os
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          seed = bytes.fromhex(os.environ["UPDATE_SIGNING_KEY"].strip())
+          sig = Ed25519PrivateKey.from_private_bytes(seed).sign(open("SHA256SUMS", "rb").read())
+          open("SHA256SUMS.sig", "wb").write(sig)
+          PY
+      - name: Verificar os artefatos antes de publicar
+        run: |
+          cd release
+          sha256sum -c SHA256SUMS
+          # confere a assinatura com o MESMO código e a MESMA chave pública que o atualizador do programa usa
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "../pc")
+          import updater
+          updater.verify_sums(open("SHA256SUMS", "rb").read(), open("SHA256SUMS.sig", "rb").read())
+          print("assinatura do SHA256SUMS confere com a chave pública embutida")
+          PY
+          tar -tzf PhoneBridgeServer-linux.tar.gz | head -5
+          test "$(stat -c %s PhoneBridge-android.apk)" -gt 1000000
+      - name: Publicar a release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         run: |
-          find dist -type f
-          mv dist/PhoneBridge-android-apk/*.apk PhoneBridge-android.apk
-          mv dist/PhoneBridge-pc-windows/pc/dist/PhoneBridgeServer.exe PhoneBridgeServer.exe 2>/dev/null || mv dist/PhoneBridge-pc-windows/PhoneBridgeServer.exe PhoneBridgeServer.exe
-          mv dist/PhoneBridge-pc-windows/dist-installer/PhoneBridgeSetup.exe PhoneBridgeSetup.exe 2>/dev/null || mv dist/PhoneBridge-pc-windows/PhoneBridgeSetup.exe PhoneBridgeSetup.exe
-          mv dist/PhoneBridge-pc-linux/PhoneBridgeServer-linux.tar.gz PhoneBridgeServer-linux.tar.gz
-          gh release create "${{ inputs.version }}" --target "${{ github.sha }}" \
-            PhoneBridge-android.apk PhoneBridgeSetup.exe PhoneBridgeServer.exe PhoneBridgeServer-linux.tar.gz \
-            --repo "${{ github.repository }}" --title "PhoneBridge ${{ inputs.version }}" --notes-file - <<'NOTES'
-          Use o celular Android como microfone ou alto-falante do PC pelo Wi-Fi.
-
-          **Arquivos**
-          - `PhoneBridge-android.apk`: app do celular (APK de depuração; permita fontes desconhecidas).
-          - `PhoneBridgeSetup.exe`: instalador para Windows (atalhos, iniciar com o Windows, Firewall e redes privadas).
-          - `PhoneBridgeServer.exe`: versão portátil para Windows, sem instalar.
-          - `PhoneBridgeServer-linux.tar.gz`: servidor para Linux (precisa de PulseAudio ou PipeWire com `pactl`, `parec` e `pacat`).
-
-          **Novidades da 2.0**
-          - Encontra o PC sozinho na rede (botão Buscar PC) e conecta lendo um QR code.
-          - Reconecta automaticamente se o Wi-Fi cair.
-          - Compressão Opus opcional (usa menos Wi-Fi), cancelamento de eco e supressão de ruído.
-          - Serviço em primeiro plano com botão Parar e pedido de isenção de bateria.
-          - PC: medidor de nível, iniciar com o Windows, firewall e redes privadas automáticos, instalação guiada do VB-Cable, versão para Linux.
-          - Protocolo documentado em PROTOCOL.md.
-
-          Sem criptografia nem senha: use só em rede confiável.
-          NOTES
+          python - <<'PY' > notes.md
+          import os, re
+          v = os.environ["VERSION"].lstrip("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[?" + re.escape(v) + r"\]?.*?$(.*?)(?=^## |\Z)", text, re.S | re.M)
+          print(m.group(1).strip() if m else "Veja o CHANGELOG.md")
+          print("\n\n**Arquivos:** `PhoneBridge-android.apk` (celular), `PhoneBridgeSetup.exe` e `PhoneBridgeServer.exe` (Windows), `PhoneBridgeServer-linux.tar.gz` (Linux).")
+          print("**Integridade:** `SHA256SUMS` (hashes) e `SHA256SUMS.sig` (assinatura Ed25519 conferida pelo atualizador do PC).")
+          PY
+          gh release create "$VERSION" --target "${{ github.sha }}" --title "PhoneBridge $VERSION" --notes-file notes.md \
+            release/PhoneBridge-android.apk release/PhoneBridgeSetup.exe release/PhoneBridgeServer.exe \
+            release/PhoneBridgeServer-linux.tar.gz release/SHA256SUMS release/SHA256SUMS.sig

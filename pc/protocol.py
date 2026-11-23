@@ -176,19 +176,42 @@ def qr_payload(host, port):
 
 
 class Discovery:
-    """Responde ao 'PBFIND1' do app com 'PBHERE1|nome|porta|opus'."""
+    """Responde ao 'PBFIND1' do app com 'PBHERE1|nome|porta|opus|proto|pcid'.
 
-    def __init__(self, name, tcp_port, opus, log=None):
+    A resposta traz só o nome do PC, a porta, o suporte a Opus, a versão máxima do protocolo e um
+    identificador público do PC (não é segredo). Respostas têm limite de frequência por origem e só vão
+    para endereços de rede local.
+    """
+
+    MAX_PER_SECOND = 5
+
+    def __init__(self, name, tcp_port, opus, log=None, pcid="", proto=3):
         self.name = name
         self.tcp_port = tcp_port
         self.opus = opus
+        self.pcid = pcid
+        self.proto = proto
         self.log = log or (lambda m: None)
         self.sock = None
         self.running = False
+        self._hits = {}
 
     def reply_bytes(self):
         name = self.name.replace("|", " ")[:60]
-        return b"|".join([DISC_REPLY, name.encode("utf-8"), str(self.tcp_port).encode(), b"1" if self.opus else b"0"])
+        parts = [DISC_REPLY, name.encode("utf-8"), str(self.tcp_port).encode(),
+                 b"1" if self.opus else b"0", str(self.proto).encode(), self.pcid.encode()]
+        return b"|".join(parts)
+
+    def _allowed(self, ip, now):
+        hits = [t for t in self._hits.get(ip, []) if now - t < 1.0]
+        if len(hits) >= self.MAX_PER_SECOND:
+            self._hits[ip] = hits
+            return False
+        hits.append(now)
+        self._hits[ip] = hits
+        if len(self._hits) > 256:  # evita crescer sem limite
+            self._hits = {k: v for k, v in self._hits.items() if v and now - v[-1] < 1.0}
+        return True
 
     def start(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -206,18 +229,25 @@ class Discovery:
         return True
 
     def _loop(self):
+        import time
+
+        from security import is_local_address
+
         while self.running:
             try:
-                data, addr = self.sock.recvfrom(256)
+                data, addr = self.sock.recvfrom(64)
             except socket.timeout:
                 continue
             except OSError:
                 break
-            if data.startswith(DISC_REQUEST):
-                try:
-                    self.sock.sendto(self.reply_bytes(), addr)
-                except OSError:
-                    pass
+            if data != DISC_REQUEST or not is_local_address(addr[0]):
+                continue
+            if not self._allowed(addr[0], time.time()):
+                continue
+            try:
+                self.sock.sendto(self.reply_bytes(), addr)
+            except OSError:
+                pass
 
     def stop(self):
         self.running = False
