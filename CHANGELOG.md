@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); versões seguem [SemVer](https://semver.org/lang/pt-BR/).
 
+## 3.0.1 — 2026-11-23
+
+### Correções
+- Android: o botão de Configurações (menu ⋮) voltou. Ele tinha sumido na 3.0.0 porque o menu foi removido por engano da tela principal; sem ele não dava para ligar o modo legado nem gerenciar os PCs pareados.
+
 ## 3.0.0 — 2026-11-23
 
 Versão principal: o protocolo mudou de forma incompatível com a 2.x (autenticação e criptografia obrigatórias por padrão).

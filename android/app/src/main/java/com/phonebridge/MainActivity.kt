@@ -305,4 +305,17 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, getString(R.string.pairing_saved, link.name), Toast.LENGTH_LONG).show()
         if (AudioService.state == AudioService.STATE_STOPPED) toggle() // um toque só: lê o QR e já conecta
     }
+
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId == R.id.action_settings) {
+            startActivity(Intent(this, SettingsActivity::class.java))
+            return true
+        }
+        return super.onOptionsItemSelected(item)
+    }
 }

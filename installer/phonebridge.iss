@@ -1,6 +1,6 @@
 ; Instalador do PhoneBridge (Windows) - compilado no CI com Inno Setup.
 #ifndef AppVersion
-  #define AppVersion "3.0.0"
+  #define AppVersion "3.0.1"
 #endif
 
 [Setup]
