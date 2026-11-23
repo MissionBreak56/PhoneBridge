@@ -160,9 +160,9 @@ def set_autostart(enabled):
 
 
 # ------------------------------------------------------------------ VB-Cable (Windows)
-# SHA-256 do pacote oficial (VBCABLE_Driver_Pack43.zip). Sem hash conhecido não instalamos automaticamente:
+# SHA-256 do pacote oficial (VBCABLE_Driver_Pack43.zip), calculado pelo CI ao baixar de download.vb-audio.com (confiança na primeira leitura: o VB-Audio não publica hash). Sem hash conhecido não instalamos automaticamente:
 # o app abre a página oficial para o usuário baixar. O CI confere se o arquivo publicado ainda bate com este hash.
-VBCABLE_SHA256 = ""
+VBCABLE_SHA256 = "66fd0a4d9f4896ff41632b7e3d53892c085c4561f53e8ae8d0f0bc10eedd1cdd"
 VBCABLE_MAX_BYTES = 8 * 1024 * 1024
 
 

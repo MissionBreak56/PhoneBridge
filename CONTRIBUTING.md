@@ -24,4 +24,4 @@ Segredos necessários (Settings > Secrets and variables > Actions): `ANDROID_KEY
 
 ## VB-Cable
 
-O hash do pacote oficial fica em `pc/sysutil.py` (`VBCABLE_SHA256`). O job `quality` do CI avisa se o arquivo publicado pelo VB-Audio mudar; atualize a constante depois de conferir o novo pacote.
+O hash do pacote oficial fica em `pc/sysutil.py` (`VBCABLE_SHA256`). Ele foi calculado pelo CI ao baixar de `download.vb-audio.com` (o VB-Audio não publica um hash, então a confiança é na primeira leitura). O job `quality` do CI avisa se o arquivo publicado pelo VB-Audio mudar; atualize a constante depois de conferir o novo pacote.
