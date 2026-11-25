@@ -29,7 +29,7 @@ phonebridge://<ip>:<porta>?v=3&id=<pcid>&pid=<pid hex>&k=<psk base64url sem padd
 
 ## 3. Conexão (TCP, porta padrão 5800)
 
-O primeiro dado decide a versão: `PAB3` (v3), `PAB1`/`PAB2` (legado). Qualquer outro início fecha a conexão.
+O primeiro dado decide o tipo: `PAB3` (conexão v3), `PAP3` (pedido de pareamento, item 3.4), `PAB1`/`PAB2` (legado). Qualquer outro início fecha a conexão.
 
 ### 3.1 Autenticação v3 (desafio-resposta mútuo)
 
@@ -76,6 +76,31 @@ tamanho  = bytes cifrados + tag (16)        nonce = 0x00000000 | contador(8)    
 - Codec: `0` = PCM 16 bits *little endian* intercalado; `1` = Opus a 48 kHz. O PC só escolhe Opus se o celular pediu, o PC permite, a taxa é 48 000 Hz e a biblioteca carregou.
 - O PC aceita **um celular por modo**. Se o mesmo celular reconecta, assume o lugar da sessão antiga; outro celular recebe REJECT (ocupado).
 
+### 3.4 Pedido de pareamento com confirmação no PC (sem QR code)
+
+Para parear sem ler o QR code. Não há segredo prévio, então a segurança vem de um **código de 6 dígitos comparado pelo usuário** (como a comparação numérica do Bluetooth).
+
+```
+C -> S   "PAP3" | ver(1)=3 | cpub(65) | nome_len(1) | nome UTF-8 (<=32)
+S -> C   "PBP3" | spub(65)                                  (pontos P-256 não comprimidos: 0x04 | X | Y)
+shared   = ECDH(P-256)
+okm      = HKDF-SHA256(ikm=shared, salt=cpub|spub, info="PBv3 pair", 64)   k_c2s = okm[0:32]  k_s2c = okm[32:64]
+código   = int(HKDF-SHA256(ikm=shared, salt=cpub|spub, info="PBv3 sas", 4)) mod 1 000 000, com 6 dígitos
+```
+
+Depois disso o PC fala com os registros cifrados do item 3.2 (chave k_s2c, contador a partir de 0). O PC mostra uma janela com o nome do celular, o IP e o código; o celular mostra o mesmo código. Se o usuário **permitir**:
+
+| Tipo | Valor | Sentido | Dados |
+|---|---|---|---|
+| PAIR_GRANT | 0x50 | S→C | `pid(8) \| psk(32) \| pcid(8) \| nome do PC UTF-8` |
+| PAIR_DENY | 0x51 | S→C | motivo UTF-8 (recusado, tempo esgotado, outro pedido em andamento) |
+
+O celular guarda `pid`, `psk` e `pcid` (iguais aos do QR) e abre uma conexão normal v3 (3.1). O dispositivo já nasce ativo no PC.
+
+- **Por que é seguro:** um atacante que se ponha no meio acaba com chaves ECDH diferentes de cada lado, logo com **códigos diferentes**; o usuário só aprova se forem iguais. Chance de um atacante gerar códigos iguais: 1 em 1 000 000 por tentativa, e cada tentativa precisa de uma aprovação.
+- **Limites no PC:** desligável nas opções; uma pergunta por vez (outro pedido recebe PAIR_DENY); no máximo 3 pedidos por origem e 10 no total por minuto; só origens de rede local; ponto P-256 inválido fecha a conexão; a janela fecha sozinha em 60 s ou quando o celular fecha a conexão.
+- Um PC que não aceita pedidos (versão antiga ou opção desligada) fecha a conexão logo após `PAP3`; o celular mostra uma mensagem explicando e sugere o QR code.
+
 ### 3.3 Vida da sessão
 
 - **Heartbeat:** os dois lados mandam HEARTBEAT a cada 2 s. Sem receber nada (nem áudio) por 6 s, o lado que espera encerra a conexão. Leituras têm limite de 8 s.
@@ -105,4 +130,4 @@ Depois: PCM cru (blocos de 10 ms) ou, se Opus, pacotes de `tamanho(2) \| dados`.
 ## 6. Segurança: o que protege e o que não protege
 
 Protege: acesso não autorizado (autenticação mútua), escuta (AES-256-GCM), repetição e adulteração (contador + tag), força bruta (limite e bloqueio), conexões de fora da rede local, mensagens malformadas ou gigantes.
-Não protege: quem vê o QR code enquanto ele está na tela; um PC ou celular já comprometidos; **sigilo futuro** (a chave de pareamento é de longo prazo: quem a roubar pode decifrar tráfego gravado antes — por isso remover o pareamento e parear de novo troca a chave). A descoberta revela na rede local o nome e a porta do PC.
+Não protege: quem vê o QR code enquanto ele está na tela; um usuário que aprova um pedido de pareamento **sem conferir o código**; um PC ou celular já comprometidos; **sigilo futuro** (a chave de pareamento é de longo prazo: quem a roubar pode decifrar tráfego gravado antes — por isso remover o pareamento e parear de novo troca a chave). A descoberta revela na rede local o nome e a porta do PC.

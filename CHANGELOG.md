@@ -2,6 +2,22 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); versões seguem [SemVer](https://semver.org/lang/pt-BR/).
 
+## 3.1.0 — 2026-11-24
+
+### Novo
+- **Pareamento com confirmação no PC (sem QR code):** ao tocar em Iniciar num PC ainda não pareado, o PC mostra uma janela "Um celular quer parear" com um **código de 6 dígitos** que também aparece no celular. Confira que são iguais e clique em **Permitir**. A conexão do pedido usa ECDH P-256 efêmero; os códigos diferentes denunciam alguém no meio da conversa. O QR code continua funcionando.
+- O celular que perdeu o pareamento (removido no PC, PC reinstalado, QR expirado) agora **esquece a chave antiga e pede um novo pareamento sozinho**, em vez de só mostrar "o PC recusou este celular".
+- Opção no PC (Mais opções) para desligar os pedidos de pareamento.
+
+### Segurança do novo recurso
+- Uma pergunta de cada vez, no máximo 3 pedidos por origem e 10 no total por minuto, só rede local, chave pública inválida recusada, a janela fecha sozinha em 60 s ou se o celular desistir, e nada é criado se o usuário recusar.
+
+### Correções
+- PC: fechar a janela do QR code **não cancela mais** o pareamento (o celular podia ainda estar pedindo a permissão do microfone e acabava recusado). O código expira em 10 minutos como antes.
+
+### Testes
+- 63 testes em Python (8 novos para o pareamento: concordância dos códigos, MITM com códigos diferentes, aprovar/recusar/expirar, desativado, chave inválida, limite, desistência do celular), mais teste de interoperabilidade Kotlin↔Python (mesmo código nos dois lados; a chave recebida conecta) e teste da janela real do PC com um celular simulado.
+
 ## 3.0.1 — 2026-11-23
 
 ### Correções

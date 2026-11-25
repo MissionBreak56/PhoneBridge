@@ -150,6 +150,9 @@ class AudioService : Service() {
         fun setError(msg: String) = setState(STATE_STOPPED, msg)
     }
 
+    /** O PC recusou a chave de pareamento guardada: ela não vale mais. */
+    private class StalePairingException : RuntimeException()
+
     /** Erro sem sentido tentar de novo (ex.: não abriu o microfone). */
     private class FatalError(msg: String) : RuntimeException(msg)
 
@@ -244,10 +247,50 @@ class AudioService : Service() {
     private fun hex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
     private fun connect(ip: String, port: Int, mode: Int, wantOpus: Boolean, pcid: String?, allowLegacy: Boolean): Link {
-        val pc = if (pcid != null) PairingStore(this).findByPcid(pcid) else null
-        if (pc != null) return connectSecure(ip, port, mode, wantOpus, pc)
-        if (!allowLegacy) throw FatalError(getString(R.string.not_paired))
+        val store = PairingStore(this)
+        var pc = if (pcid != null) store.findByPcid(pcid) else null
+        if (pc != null) {
+            try {
+                return connectSecure(ip, port, mode, wantOpus, pc)
+            } catch (e: StalePairingException) {
+                // o PC não reconhece mais este celular (removido no PC, PC reinstalado, QR expirado): esquece o pareamento
+                // antigo e pede um novo, com confirmação no PC
+                store.remove(pc.pcid)
+                pc = null
+            }
+        }
+        try {
+            return connectSecure(ip, port, mode, wantOpus, requestPairing(ip, port, store))
+        } catch (e: PairingUnsupportedException) {
+            // PC que não aceita pedidos de pareamento: PC antigo (v2) ou opção desligada no PC
+            if (!allowLegacy) throw FatalError(getString(R.string.pair_unsupported))
+        }
         return connectLegacy(ip, port, mode, wantOpus)
+    }
+
+    /** Pede o pareamento ao PC e espera a aprovação dele; mostra no celular o código que o usuário deve conferir. */
+    private fun requestPairing(ip: String, port: Int, store: PairingStore): PairedPc {
+        val s = newSocket(ip, port)
+        try {
+            val res = PairingClient.request(s, Build.MODEL ?: "Android") { code ->
+                val shown = code.substring(0, 3) + " " + code.substring(3)
+                val text = getString(R.string.pairing_waiting, shown)
+                setState(STATE_STARTING, null, text)
+                updateNotification(text)
+            }
+            val pc = PairedPc(
+                res.pcid, res.pcName, ip, port,
+                res.pid.joinToString("") { "%02x".format(it) }, res.secret, System.currentTimeMillis()
+            )
+            store.save(pc)
+            return pc
+        } catch (e: PairingDeniedException) {
+            throw FatalError(getString(R.string.pairing_denied, e.reason))
+        } catch (e: java.net.SocketTimeoutException) {
+            throw FatalError(getString(R.string.pairing_timeout))
+        } finally {
+            try { s.close() } catch (_: Exception) {}
+        }
     }
 
     private fun connectSecure(ip: String, port: Int, mode: Int, wantOpus: Boolean, pc: PairedPc): Link {
@@ -259,7 +302,8 @@ class AudioService : Service() {
             link.start(drain = mode == 1)
             return link
         } catch (e: AuthRejectedException) {
-            throw FatalError(getString(R.string.auth_failed))
+            try { s.close() } catch (_: Exception) {}
+            throw StalePairingException()
         } catch (e: UnsupportedVersionException) {
             throw FatalError(getString(R.string.pc_version_unsupported))
         } catch (e: RejectedException) {

@@ -197,10 +197,6 @@ class MainActivity : AppCompatActivity() {
         var port = prefs.getString("port", "5800")?.toIntOrNull() ?: 5800
         val paired = pairings.findByHost(ip)
         val allowLegacy = prefs.getBoolean("allowLegacy", false)
-        if (paired == null && !allowLegacy) {
-            AudioService.setError(getString(R.string.not_paired))
-            return
-        }
         if (paired != null) port = paired.port
         val mode = currentMode()
         val source = prefs.getString("audioSource", "0")?.toIntOrNull() ?: 0

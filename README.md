@@ -3,7 +3,7 @@
 Use o celular Android como **microfone** ou **alto-falante** do PC pelo Wi-Fi, sem anúncios e sem telemetria.
 O app do PC roda em **Windows 10/11** e **Linux**; o app do celular precisa de **Android 7.0** (API 24) ou mais novo.
 
-Versão atual: **3.0.0** · [Baixar na página de Releases](../../releases/latest)
+Versão atual: **3.1.0** · [Baixar na página de Releases](../../releases/latest)
 
 ---
 
@@ -76,13 +76,16 @@ Instale o `PhoneBridge-android.apk`. Na primeira vez o app pede permissão para 
 
 ## Conectar o celular ao PC
 
-Na versão 3 o celular precisa ser **pareado** uma vez com cada PC. Depois disso conecta sozinho.
+Na versão 3 o celular precisa ser **pareado** uma vez com cada PC. Depois disso conecta sozinho. Há dois jeitos de parear:
 
-1. **Parear (uma vez):** no PC, clique em **Parear celular (QR code)**; no celular, toque em **QR code** e aponte para o quadro. O app guarda a chave (cifrada com o Android Keystore) e já conecta. O QR vale por 10 minutos e para um aparelho só; contém a chave de pareamento, então mostre apenas ao seu celular.
-2. **Depois do pareamento:** toque em **Buscar PC** (acha o PC na rede e atualiza o IP se ele mudou) ou digite o IP e toque em **Iniciar**.
-3. **Remover um celular:** no PC, **Celulares autorizados** > Remover (a sessão cai na hora). No celular: Configurações > **PCs pareados**.
+1. **Pedindo permissão ao PC (sem QR):** no celular, deixe o IP do PC (ou toque em **Buscar PC**) e toque em **Iniciar**. O celular mostra um **código de 6 dígitos** e o PC abre uma janela "Um celular quer parear". **Confira que o código é o mesmo nos dois** e clique em **Permitir** (ou **Recusar**; a janela fecha sozinha em 60 s). Se o código for diferente, ou se você não está pareando agora, recuse.
+2. **QR code:** no PC, clique em **Parear celular (QR code)**; no celular, toque em **QR code** e aponte para o quadro. O QR vale por 10 minutos e para um aparelho só; contém a chave de pareamento, então mostre apenas ao seu celular.
 
-PCs e celulares da versão 2.x ou anterior não têm pareamento: veja [Compatibilidade com versões antigas](#compatibilidade-com-versões-antigas).
+Depois do pareamento: toque em **Buscar PC** (acha o PC e atualiza o IP se ele mudou) ou digite o IP e toque em **Iniciar**. Se o PC deixar de reconhecer o celular (removido na lista, PC reinstalado), o app esquece a chave antiga e pede um novo pareamento sozinho.
+
+**Remover um celular:** no PC, **Celulares autorizados** > Remover (a sessão cai na hora). No celular: menu ⋮ > Configurações > **PCs pareados**.
+
+Os pedidos de pareamento podem ser desligados no PC em Mais opções. PCs e celulares da versão 2.x ou anterior não têm pareamento: veja [Compatibilidade com versões antigas](#compatibilidade-com-versões-antigas).
 
 ## Usando
 
@@ -149,7 +152,9 @@ Redes de convidado e alguns roteadores bloqueiam a comunicação entre aparelhos
 | O QR code não conecta | O QR usa o IP da interface principal; com VPN ou várias placas de rede ele pode apontar para a errada. Digite o IP manualmente |
 | O áudio para com a tela apagada | Aceite o pedido de isenção da otimização de bateria (ou use a opção nas configurações) |
 | Mensagem "O PC recusou a conexão" | Escolha uma saída de áudio válida no PC (modo microfone) e confira se o dispositivo não está em uso exclusivo por outro app |
-| "Este PC ainda não foi pareado" / "O PC recusou este celular" | Pareie de novo: no PC **Parear celular (QR code)** e leia no celular. Acontece se o pareamento foi removido, expirou (10 min sem usar) ou se o PC foi reinstalado |
+| "O PC não permitiu o pareamento" | Você (ou o tempo) recusou o pedido no PC. Toque em Iniciar de novo e clique em Permitir |
+| "Este PC não aceita pedidos de pareamento" | A opção está desligada no PC (Mais opções) ou o PC é de uma versão antiga. Ligue a opção ou pareie pelo QR code |
+| O PC não mostra a janela de pareamento | O servidor precisa estar **iniciado** no PC, o Firewall liberado e as duas máquinas na mesma rede. A janela também chega pela bandeja |
 | "O PC exige pareamento" (app antigo no celular) | Atualize o app do celular para a versão 3 e pareie. Se não puder, ligue o modo legado só em rede de confiança |
 | "Outro celular já está usando este modo" | O PC aceita um celular por modo (microfone e alto-falante podem ser dois celulares diferentes). Desconecte o outro |
 | "Origem bloqueada" no registro do PC | Houve várias tentativas inválidas de um mesmo endereço; o bloqueio passa sozinho (de 1 a 15 min) |
@@ -174,7 +179,7 @@ gradle assembleDebug
 cd pc
 pip install -r requirements.txt pytest
 python server.py            # --tray inicia escondido na bandeja e liga o servidor
-python -m pytest tests -q   # 55 testes: protocolo, autenticação, criptografia, sessões, atualizador, sysutil
+python -m pytest tests -q   # 63 testes: protocolo, pareamento, autenticação, criptografia, sessões, atualizador, sysutil
 ```
 
 Dependências: `numpy`, `pyaudiowpatch` (só Windows), `pystray`, `Pillow`, `qrcode`, `opuslib-next` e `cryptography`. O Opus precisa da biblioteca nativa: `opus.dll` no Windows e `libopus.so.0` no Linux; sem ela o programa funciona só em PCM. No Linux também é preciso o Tk (`python3-tk`).
@@ -260,6 +265,8 @@ Este repositório ainda **não tem um arquivo de licença** para o código do Ph
 
 ## Histórico de versões
 
+- **3.1.0** — Pareamento com confirmação no PC (janela com código de 6 dígitos), renovação automática do pareamento perdido, fechar a janela do QR não cancela mais o pareamento.
+- **3.0.1** — Menu de Configurações do Android restaurado.
 - **3.0.0** — Segurança: pareamento por QR, autenticação mútua, criptografia AES-256-GCM, limites e bloqueio de tentativas, só rede local; heartbeat e expiração de sessões; fila de áudio por duração (sem `available()`); atualizador assinado; gravação WAV; diagnóstico; APK de release assinado e SHA-256. Veja o [CHANGELOG.md](CHANGELOG.md).
 - **2.0.1** — Leitor de QR em pé, com moldura quadrada.
 - **2.0.0** — Busca automática do PC e QR code; reconexão automática; Opus opcional; cancelamento de eco e supressão de ruído; serviço com botão Parar e isenção de bateria; PC: medidor de nível, iniciar com o sistema, Firewall e redes privadas automáticos, instalação guiada do VB-Cable, versão para Linux e instalador do Windows; protocolo v2 documentado em `PROTOCOL.md`.

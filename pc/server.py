@@ -237,6 +237,7 @@ class App:
         self.record_var = tk.BooleanVar(value=False)  # gravação sempre começa desligada
         self.disc_var = tk.BooleanVar(value=bool(self.cfg.get("discovery", True)))
         self.upd_var = tk.BooleanVar(value=bool(self.cfg.get("check_updates", True)))
+        self.pairreq_var = tk.BooleanVar(value=bool(self.cfg.get("pairing_requests", True)))
         more = tk.Menubutton(wrap, text="Mais opções  ▾", bg=SURFACE, fg=TEXT, activebackground=BORDER,
                              activeforeground=TEXT, relief="flat", font=(FONT, 9), pady=6, cursor="hand2")
         menu = tk.Menu(more, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=ACCENT, activeforeground="#ffffff")
@@ -250,6 +251,8 @@ class App:
                              variable=self.disc_var, command=self._opts_changed)
         menu.add_checkbutton(label="Verificar atualizações ao abrir", variable=self.upd_var,
                              command=self._opts_changed)
+        menu.add_checkbutton(label="Aceitar pedidos de pareamento do celular (pede a sua confirmação)",
+                             variable=self.pairreq_var, command=self._opts_changed)
         menu.add_separator()
         menu.add_checkbutton(label="Aceitar apps antigos SEM proteção (inseguro)", variable=self.legacy_var,
                              command=self._legacy_toggled)
@@ -407,9 +410,7 @@ class App:
             self.log("Link de pareamento copiado (vale por 10 minutos).")
 
         def close():
-            if not any(d["pid"] == pid and d["active"] for d in self.registry.list_devices()):
-                self.registry.revoke(pid)  # fechou sem usar: o código deixa de valer
-            win.destroy()
+            win.destroy()  # o código continua valendo até expirar (10 min): o celular pode ainda estar conectando
 
         b = FlatButton(win, "Copiar link de pareamento", copy, bg=SURFACE, hover=BORDER, fg=TEXT)
         b.config(font=(FONT, 9), pady=6)
@@ -417,6 +418,71 @@ class App:
         win.protocol("WM_DELETE_WINDOW", close)
         self.qr_win = win
         self.log("Pareamento criado: leia o QR code no celular em até 10 minutos.")
+
+    # ---- pedido de pareamento vindo do celular (sem QR): o usuário confere o código e aprova
+    def _pair_handler(self, name, ip, code, holder):
+        """Chamado pela thread do servidor; a pergunta aparece na interface."""
+        self.ui_q.put(("pair_request", name, ip, code, holder))
+
+    def _show_pair_request(self, name, ip, code, holder):
+        if holder.event.is_set():
+            return
+        self.show()
+        if self.tray:
+            try:
+                self.tray.notify(f"{name} quer parear. Confira o código.", "PhoneBridge")
+            except Exception:  # noqa: BLE001
+                pass
+        win = tk.Toplevel(self.root)
+        win.title("PhoneBridge - pedido de pareamento")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(win, text="Um celular quer parear com este PC", bg=BG, fg=TEXT, font=(FONT, 13, "bold")).pack(padx=24, pady=(20, 4))
+        tk.Label(win, text=f"{name}\n{ip}", bg=BG, fg=MUTED_TXT, font=(FONT, 10)).pack()
+        tk.Label(win, text=f"{code[:3]} {code[3:]}", bg=BG, fg=ACCENT, font=(FONT, 36, "bold")).pack(pady=(10, 4))
+        tk.Label(win, text="Confira se este código é IGUAL ao que aparece na tela do celular.\nSe for diferente, ou se você não "
+                 "está pareando agora, clique em Recusar.", bg=BG, fg=TEXT, font=(FONT, 9), justify="center",
+                 wraplength=380).pack(padx=24)
+        left = tk.Label(win, text="", bg=BG, fg=MUTED_TXT, font=(FONT, 9))
+        left.pack(pady=(8, 4))
+        state = {"remaining": int(sec.PAIR_TIMEOUT)}
+
+        def decide(ok):
+            if not holder.event.is_set():
+                holder.answer(ok)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(padx=24, pady=(4, 20), fill="x")
+        allow = FlatButton(row, "Permitir", lambda: decide(True))
+        allow.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        deny = FlatButton(row, "Recusar", lambda: decide(False), bg=SURFACE, hover=BORDER, fg=TEXT)
+        deny.pack(side="left", fill="x", expand=True)
+        win.protocol("WM_DELETE_WINDOW", lambda: decide(False))
+
+        def tick():
+            if holder.event.is_set():  # respondido, expirou ou o celular desistiu
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                return
+            state["remaining"] -= 1
+            if state["remaining"] <= 0:
+                decide(False)
+                return
+            left.config(text=f"Fecha sozinho em {state['remaining']} s")
+            win.after(1000, tick)
+
+        left.config(text=f"Fecha sozinho em {state['remaining']} s")
+        win.after(1000, tick)
 
     def show_devices(self):
         if self.devices_win is not None:
@@ -584,10 +650,11 @@ class App:
 
     def _opts_changed(self):
         self.cfg.update(opus=bool(self.opus_var.get()), discovery=bool(self.disc_var.get()),
-                        check_updates=bool(self.upd_var.get()))
+                        check_updates=bool(self.upd_var.get()), pairing_requests=bool(self.pairreq_var.get()))
         save_config(self.cfg)
         if self.server:
             self.server.opus_allowed = self.cfg["opus"]
+            self.server.pairing_enabled = self.cfg["pairing_requests"]
             self.server.record_dir = self._record_dir()  # vale para as próximas conexões
         if self.record_var.get():
             self.log(f"Gravação ligada: vale para as próximas conexões ({self._record_dir()}).")
@@ -789,6 +856,8 @@ class App:
             act = self.ui_q.get()
             if isinstance(act, tuple) and act[0] == "ask_net":
                 self._ask_net(*act[1:])
+            elif isinstance(act, tuple) and act[0] == "pair_request":
+                self._show_pair_request(*act[1:])
             elif isinstance(act, tuple) and act[0] == "update":
                 self._show_update(*act[1:])
             elif isinstance(act, tuple) and act[0] == "update_done":
@@ -869,6 +938,8 @@ class App:
                 allow_legacy=bool(self.cfg.get("allow_legacy", False)), limiter=self.limiter,
                 discovery_enabled=bool(self.disc_var.get()), record_dir=self._record_dir())
             self.server.muted = self.muted
+            self.server.pair_handler = self._pair_handler
+            self.server.pairing_enabled = bool(self.pairreq_var.get())
             self.server.start()
             if not self.backend.virtual_mic_ready():
                 self.log("Aviso: sem microfone virtual, o modo microfone toca só na saída escolhida; "

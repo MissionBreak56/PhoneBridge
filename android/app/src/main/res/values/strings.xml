@@ -62,7 +62,7 @@
     </string-array>
     <string name="not_paired">This PC is not paired yet. Tap QR code and scan the code shown by PhoneBridge on the PC.</string>
     <string name="not_paired_tag">(not paired)</string>
-    <string name="found_not_paired">PC found, but not paired yet. Tap QR code to pair.</string>
+    <string name="found_not_paired">PC found, but not paired yet. Tap Start to ask the PC for permission (or use QR code).</string>
     <string name="auth_failed">The PC refused this phone. Pair again with the QR code (the pairing may have been removed on the PC).</string>
     <string name="pc_version_unsupported">The PC uses an incompatible PhoneBridge version. Update both apps.</string>
     <string name="pc_busy">Another phone is already using this mode on the PC</string>
@@ -76,6 +76,10 @@
     <string name="no_paired">No paired PCs yet</string>
     <string name="forget">Remove</string>
     <string name="forget_confirm">Remove the pairing with %1$s? You will need to scan its QR code again.</string>
+    <string name="pairing_waiting">Confirm this code on the PC:\n%1$s</string>
+    <string name="pairing_denied">The PC did not allow the pairing (%1$s).</string>
+    <string name="pairing_timeout">The PC did not answer the pairing request.</string>
+    <string name="pair_unsupported">This PC does not accept pairing requests. Turn the option on in PhoneBridge on the PC (More options) or pair with the QR code button.</string>
     <string-array name="audio_source_entries">
         <item>Default</item>
         <item>Mic</item>

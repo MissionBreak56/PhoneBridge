@@ -19,6 +19,8 @@ import threading
 import time
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 PROTO_V3 = 3
@@ -38,6 +40,13 @@ T_REJECT = 0x12
 T_AUDIO = 0x20
 T_HEARTBEAT = 0x30
 T_CLOSE = 0x40
+T_PAIR_GRANT = 0x50  # PC -> celular: pareamento aprovado (pid, chave, id do PC, nome)
+T_PAIR_DENY = 0x51  # PC -> celular: recusado (motivo em texto)
+
+MAGIC_PAIR = b"PAP3"  # pedido de pareamento com confirmação no PC
+MAGIC_PAIR_S = b"PBP3"  # resposta do PC (chave pública efêmera)
+PAIR_PUB_LEN = 65  # ponto P-256 não comprimido (0x04 | X | Y)
+PAIR_TIMEOUT = 60.0  # tempo para o usuário aprovar no PC
 
 REJECT_BUSY = 1
 REJECT_NO_OUTPUT = 2
@@ -305,3 +314,45 @@ def pairing_link(host, port, pcid, pid, psk, name):
     from urllib.parse import quote
 
     return f"phonebridge://{host}:{port}?v=3&id={pcid}&pid={pid}&k={b64u(psk)}&n={quote(name)}"
+
+
+# ----------------------------------------------------------------- pareamento com confirmação no PC
+# Sem QR code não existe segredo prévio, então usamos ECDH (P-256) efêmero e um CÓDIGO DE 6 DÍGITOS que os dois
+# aparelhos mostram: o usuário compara os códigos e aprova no PC. Quem tentar se colocar no meio da conversa
+# (MITM) acaba com chaves diferentes de cada lado e, portanto, com códigos diferentes: o usuário recusa.
+def pair_generate():
+    """Retorna (chave privada, chave pública de 65 bytes)."""
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    return priv, pub
+
+
+def pair_derive(priv, peer_pub, cpub, spub):
+    """Retorna (chave celular->PC, chave PC->celular, código de 6 dígitos). Levanta ProtocolError se a chave for inválida."""
+    try:
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer_pub)
+        shared = priv.exchange(ec.ECDH(), peer)
+    except (ValueError, TypeError):
+        raise ProtocolError("chave pública de pareamento inválida")
+    salt = cpub + spub
+    okm = hkdf_sha256(shared, salt, b"PBv3 pair", 64)
+    sas = int.from_bytes(hkdf_sha256(shared, salt, b"PBv3 sas", 4), "big") % 1_000_000
+    return okm[:32], okm[32:], f"{sas:06d}"
+
+
+class PairRateLimiter:
+    """No máximo `per_ip` pedidos de pareamento por origem e `total` no geral dentro da janela (evita encher o PC de janelas)."""
+
+    def __init__(self, per_ip=3, total=10, window=60.0, clock=time.time):
+        self.per_ip, self.total, self.window, self.clock = per_ip, total, window, clock
+        self.lock = threading.Lock()
+        self.hits = []  # (ip, t)
+
+    def allow(self, ip):
+        with self.lock:
+            now = self.clock()
+            self.hits = [(i, t) for (i, t) in self.hits if now - t < self.window]
+            if len(self.hits) >= self.total or sum(1 for i, _ in self.hits if i == ip) >= self.per_ip:
+                return False
+            self.hits.append((ip, now))
+            return True

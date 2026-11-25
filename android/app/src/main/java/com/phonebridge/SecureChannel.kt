@@ -5,8 +5,17 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
 import java.net.Socket
+import java.math.BigInteger
+import java.nio.ByteBuffer
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECPoint
+import java.security.spec.ECPublicKeySpec
+import javax.crypto.KeyAgreement
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.Mac
@@ -30,6 +39,13 @@ object Proto3 {
     const val T_AUDIO = 0x20
     const val T_HEARTBEAT = 0x30
     const val T_CLOSE = 0x40
+    const val T_PAIR_GRANT = 0x50
+    const val T_PAIR_DENY = 0x51
+
+    val MAGIC_PAIR = "PAP3".toByteArray(Charsets.US_ASCII)
+    val MAGIC_PAIR_SERVER = "PBP3".toByteArray(Charsets.US_ASCII)
+    const val PAIR_PUB_LEN = 65
+    const val PAIR_WAIT_MS = 70_000
 
     const val REJECT_BUSY = 1
     const val REJECT_NO_OUTPUT = 2
@@ -321,6 +337,96 @@ class V3Channel private constructor(
         try {
             socket.close()
         } catch (_: Exception) {
+        }
+    }
+}
+
+
+/** O PC recusou (ou deixou expirar) o pedido de pareamento. */
+class PairingDeniedException(val reason: String) : IOException(reason)
+
+/** O PC fechou a conexão ao receber o pedido: versão antiga ou pedidos de pareamento desativados. */
+class PairingUnsupportedException : IOException("o PC não aceita pedidos de pareamento")
+
+class PairingResult(val pid: ByteArray, val secret: ByteArray, val pcid: String, val pcName: String)
+
+/**
+ * Pareamento com confirmação no PC (sem QR code): ECDH P-256 efêmero + código de 6 dígitos que o PC e o celular
+ * mostram. O usuário confere os códigos e aprova no PC; se alguém estiver no meio da conversa, os códigos diferem.
+ */
+object PairingClient {
+    private fun fixed32(v: BigInteger): ByteArray {
+        val raw = v.toByteArray()
+        val out = ByteArray(32)
+        val n = minOf(raw.size, 32)
+        System.arraycopy(raw, raw.size - n, out, 32 - n, n)
+        return out
+    }
+
+    private fun encodePoint(p: ECPoint) = byteArrayOf(4) + fixed32(p.affineX) + fixed32(p.affineY)
+
+    /** [onCode] recebe o código de 6 dígitos para mostrar na tela enquanto espera a aprovação no PC. */
+    fun request(socket: Socket, deviceName: String, onCode: (String) -> Unit): PairingResult {
+        val inp = DataInputStream(socket.getInputStream())
+        val out = socket.getOutputStream()
+        val gen = KeyPairGenerator.getInstance("EC")
+        gen.initialize(ECGenParameterSpec("secp256r1"))
+        val kp = gen.generateKeyPair()
+        val pub = kp.public as ECPublicKey
+        val cpub = encodePoint(pub.w)
+        val nm = deviceName.toByteArray(Charsets.UTF_8).let { if (it.size > Proto3.MAX_NAME) it.copyOf(Proto3.MAX_NAME) else it }
+        out.write(Proto3.MAGIC_PAIR + byteArrayOf(Proto3.VERSION.toByte()) + cpub + byteArrayOf(nm.size.toByte()) + nm)
+        out.flush()
+
+        val head = ByteArray(4)
+        try {
+            inp.readFully(head)
+        } catch (e: EOFException) {
+            throw PairingUnsupportedException()
+        }
+        if (!head.contentEquals(Proto3.MAGIC_PAIR_SERVER)) throw ProtocolException("resposta inválida do PC")
+        val spub = ByteArray(Proto3.PAIR_PUB_LEN)
+        inp.readFully(spub)
+        if (spub[0].toInt() != 4) throw ProtocolException("chave pública inválida")
+
+        val peerPoint = ECPoint(BigInteger(1, spub.copyOfRange(1, 33)), BigInteger(1, spub.copyOfRange(33, 65)))
+        val peer = try {
+            KeyFactory.getInstance("EC").generatePublic(ECPublicKeySpec(peerPoint, pub.params))
+        } catch (e: Exception) {
+            throw ProtocolException("chave pública inválida")
+        }
+        val ka = KeyAgreement.getInstance("ECDH")
+        ka.init(kp.private)
+        ka.doPhase(peer, true)
+        val shared = ka.generateSecret()
+        val salt = cpub + spub
+        val okm = Crypto.hkdf(shared, salt, "PBv3 pair".toByteArray(), 64)
+        val sas = (ByteBuffer.wrap(Crypto.hkdf(shared, salt, "PBv3 sas".toByteArray(), 4)).int.toLong() and 0xFFFFFFFFL) % 1_000_000L
+        onCode("%06d".format(sas))
+
+        val reader = RecordReader(okm.copyOfRange(32, 64)) // PC -> celular
+        socket.soTimeout = Proto3.PAIR_WAIT_MS
+        val header = ByteArray(2)
+        try {
+            inp.readFully(header)
+        } catch (e: EOFException) {
+            throw PairingDeniedException("conexão encerrada pelo PC")
+        }
+        val n = ((header[0].toInt() and 0xFF) shl 8) or (header[1].toInt() and 0xFF)
+        if (n < Proto3.TAG_LEN + 1 || n > Proto3.MAX_PLAINTEXT + Proto3.TAG_LEN) throw ProtocolException("tamanho inválido: $n")
+        val ct = ByteArray(n)
+        inp.readFully(ct)
+        val (type, p) = reader.open(header, ct)
+        when (type) {
+            Proto3.T_PAIR_GRANT -> {
+                if (p.size < 8 + 32 + 8) throw ProtocolException("resposta de pareamento malformada")
+                val pcid = p.copyOfRange(40, 48).joinToString("") { "%02x".format(it) }
+                return PairingResult(
+                    p.copyOfRange(0, 8), p.copyOfRange(8, 40), pcid, String(p, 48, p.size - 48, Charsets.UTF_8)
+                )
+            }
+            Proto3.T_PAIR_DENY -> throw PairingDeniedException(String(p, Charsets.UTF_8))
+            else -> throw ProtocolException("resposta inesperada: $type")
         }
     }
 }

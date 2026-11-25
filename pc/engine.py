@@ -32,6 +32,31 @@ class AuthError(Exception):
     pass
 
 
+class PairingHolder:
+    """Resultado de uma pergunta feita ao usuário (a interface responde de outra thread)."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.approved = False
+
+    def answer(self, approved):
+        self.approved = bool(approved)
+        self.event.set()
+
+
+def peer_closed(conn):
+    """True se o outro lado já fechou a conexão (sem consumir dados)."""
+    import select
+
+    try:
+        readable, _, _ = select.select([conn], [], [], 0)
+        if readable:
+            return conn.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
+    return False
+
+
 def kill(conn):
     """Fecha de verdade: o shutdown acorda quem está bloqueado lendo este socket em outra thread."""
     try:
@@ -185,6 +210,12 @@ class BridgeServer:
         self.limiter = limiter or sec.AuthLimiter()
         self.discovery_enabled = discovery_enabled
         self.record_dir = record_dir  # None = não grava
+        # pareamento com confirmação no PC: função(nome, ip, código, holder); a interface mostra a pergunta e chama
+        # holder.answer(True/False). Sem função (ou desligado), pedidos de pareamento são recusados.
+        self.pair_handler = None
+        self.pairing_enabled = True
+        self.pair_limiter = sec.PairRateLimiter()
+        self._pairing_lock = threading.Lock()
         self.running = False
         self.sock = None
         self.conns = set()
@@ -331,6 +362,8 @@ class BridgeServer:
             magic = pr.recv_exact(conn, 4)
             if magic == sec.MAGIC_V3:
                 self._handle_v3(conn, addr, preauth_done)
+            elif magic == sec.MAGIC_PAIR:
+                self._handle_pairing(conn, addr)
             elif magic in (pr.MAGIC_V1, pr.MAGIC_V2):
                 self._handle_legacy(conn, addr, 1 if magic == pr.MAGIC_V1 else 2, preauth_done)
             else:
@@ -421,6 +454,63 @@ class BridgeServer:
                 self._speaker(io, conn, mask, sec.PROTO_V3, accept, reject)
         finally:
             io.close()
+
+    # ---- pareamento com confirmação no PC (sem QR code)
+    def _handle_pairing(self, conn, addr):
+        ip = addr[0]
+        ver = pr.recv_exact(conn, 1)[0]
+        cpub = pr.recv_exact(conn, sec.PAIR_PUB_LEN)
+        nlen = pr.recv_exact(conn, 1)[0]
+        if ver != sec.PROTO_V3 or nlen > sec.MAX_NAME:
+            raise sec.ProtocolError("pedido de pareamento inválido")
+        try:
+            name = pr.recv_exact(conn, nlen).decode("utf-8")
+        except UnicodeDecodeError:
+            name = ""
+        name = "".join(ch for ch in name if ch.isprintable())[:sec.MAX_NAME] or ip
+        if not self.pairing_enabled or self.pair_handler is None or self.registry is None:
+            raise AuthError("pedido de pareamento recusado (desativado neste PC)")
+        if not self.pair_limiter.allow(ip):
+            raise AuthError("pedidos de pareamento demais; aguarde um minuto")
+        priv, spub = sec.pair_generate()
+        k_c2s, k_s2c, code = sec.pair_derive(priv, cpub, cpub, spub)
+        conn.sendall(sec.MAGIC_PAIR_S + spub)
+        io = SecureIO(conn, sec.RecordReader(k_c2s), sec.RecordWriter(k_s2c), self.log)
+        if not self._pairing_lock.acquire(blocking=False):  # uma pergunta de cada vez
+            io.send(sec.T_PAIR_DENY, "outro pedido de pareamento está em andamento".encode())
+            return
+        try:
+            holder = PairingHolder()
+            conn.settimeout(None)
+            self.log(f"Pedido de pareamento de {name} [{ip}] (código {code[:3]} {code[3:]})")
+            self.pair_handler(name, ip, code, holder)
+            # espera a resposta do usuário; se o celular desistir (fechar a conexão), para de esperar
+            end = time.time() + sec.PAIR_TIMEOUT
+            while not holder.event.wait(0.3):
+                if time.time() > end or not self.running or peer_closed(conn):
+                    break
+            if not holder.event.is_set():
+                holder.answer(False)  # o diálogo fecha sozinho
+                io.send(sec.T_PAIR_DENY, "tempo esgotado no PC".encode())
+                self.log("Pareamento: tempo esgotado sem resposta")
+                return
+            if not holder.approved:
+                io.send(sec.T_PAIR_DENY, "recusado no PC".encode())
+                self.log("Pareamento recusado no PC")
+                return
+            pid_hex, psk = self.registry.create_pairing()
+            self.registry.mark_seen(pid_hex, ip, name)  # já fica ativo: a aprovação foi o pareamento
+            try:
+                pcname = socket.gethostname()
+            except OSError:
+                pcname = "PC"
+            payload = (bytes.fromhex(pid_hex) + psk + bytes.fromhex(self.registry.pcid) +
+                       pcname.encode("utf-8")[:sec.MAX_NAME])
+            io.send(sec.T_PAIR_GRANT, payload)
+            self.stats["pairings"] += 1
+            self.log(f"Pareamento aprovado: {name}")
+        finally:
+            self._pairing_lock.release()
 
     def _claim(self, mode, conn, pid_hex):
         """Um celular por modo. Se o mesmo celular reconecta, assume o lugar da sessão antiga."""

@@ -18,6 +18,7 @@ Abra um [aviso de segurança privado](../../security/advisories/new) no GitHub (
 - Atualizações só são instaladas se a assinatura Ed25519 do `SHA256SUMS` e o SHA-256 do arquivo conferirem.
 
 **Não protegido:**
+- Um usuário que clica em **Permitir** num pedido de pareamento sem conferir se o código é igual ao do celular (o código é a única defesa contra alguém no meio da conversa). Se não estiver pareando agora, clique em Recusar; dá para desligar os pedidos nas opções.
 - Quem vê o QR code de pareamento enquanto ele está na tela (vale 10 minutos e um aparelho).
 - Um PC ou celular já comprometido (as chaves ficam no Android Keystore e em `devices.json`; no Windows este arquivo depende da proteção do perfil do usuário).
 - **Sigilo futuro:** a chave de pareamento é de longa duração. Se vazar, remova o dispositivo e pareie de novo.

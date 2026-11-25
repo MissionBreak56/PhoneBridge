@@ -57,7 +57,7 @@
     </string-array>
     <string name="not_paired">Este PC ainda não foi pareado. Toque em QR code e leia o código mostrado pelo PhoneBridge no PC.</string>
     <string name="not_paired_tag">(não pareado)</string>
-    <string name="found_not_paired">PC encontrado, mas ainda não pareado. Toque em QR code para parear.</string>
+    <string name="found_not_paired">PC encontrado, mas ainda não pareado. Toque em Iniciar para pedir permissão ao PC (ou use o QR code).</string>
     <string name="auth_failed">O PC recusou este celular. Pareie de novo com o QR code (o pareamento pode ter sido removido no PC).</string>
     <string name="pc_version_unsupported">O PC usa uma versão incompatível do PhoneBridge. Atualize os dois apps.</string>
     <string name="pc_busy">Outro celular já está usando este modo no PC</string>
@@ -71,6 +71,10 @@
     <string name="no_paired">Nenhum PC pareado ainda</string>
     <string name="forget">Remover</string>
     <string name="forget_confirm">Remover o pareamento com %1$s? Será preciso ler o QR code dele de novo.</string>
+    <string name="pairing_waiting">Confirme este código no PC:\n%1$s</string>
+    <string name="pairing_denied">O PC não permitiu o pareamento (%1$s).</string>
+    <string name="pairing_timeout">O PC não respondeu ao pedido de pareamento.</string>
+    <string name="pair_unsupported">Este PC não aceita pedidos de pareamento. Ative a opção no PhoneBridge do PC (Mais opções) ou pareie pelo botão QR code.</string>
     <string-array name="audio_source_entries">
         <item>Padrão</item>
         <item>Microfone</item>

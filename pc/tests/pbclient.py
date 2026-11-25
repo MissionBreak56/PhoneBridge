@@ -62,3 +62,30 @@ class V3Client:
             self.sock.close()
         except OSError:
             pass
+
+
+def pair_request(host, port, name="Celular de Teste", timeout=10, on_code=None, tamper_peer=False):
+    """Pede pareamento com confirmação no PC. Retorna dict(ok, pid, psk, pcid, pcname, code) ou (ok=False, reason)."""
+    import socket as _s
+
+    sock = _s.create_connection((host, port), timeout=timeout)
+    priv, cpub = sec.pair_generate()
+    nm = name.encode()
+    sock.sendall(sec.MAGIC_PAIR + bytes([3]) + cpub + bytes([len(nm)]) + nm)
+    head = pr.recv_exact(sock, 4)
+    assert head == sec.MAGIC_PAIR_S, head
+    spub = pr.recv_exact(sock, sec.PAIR_PUB_LEN)
+    # a ordem do sal é sempre cpub | spub, igual nos dois lados
+    k_c2s, k_s2c, code = sec.pair_derive(priv, spub, cpub, spub)
+    if on_code:
+        on_code(code)
+    reader = sec.RecordReader(k_s2c)
+    sock.settimeout(timeout)
+    try:
+        rtype, p = sec.read_record(sock, reader, pr.recv_exact)
+    finally:
+        pass
+    sock.close()
+    if rtype == sec.T_PAIR_GRANT:
+        return {"ok": True, "pid": p[:8].hex(), "psk": p[8:40], "pcid": p[40:48].hex(), "pcname": p[48:].decode(), "code": code}
+    return {"ok": False, "reason": p.decode(), "code": code}

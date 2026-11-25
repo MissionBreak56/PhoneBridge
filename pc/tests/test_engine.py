@@ -21,7 +21,7 @@ import protocol as pr  # noqa: E402
 import security as sec  # noqa: E402
 from audio_backend import Backend, chunk_bytes  # noqa: E402
 from engine import BridgeServer  # noqa: E402
-from pbclient import V3Client  # noqa: E402
+from pbclient import V3Client, pair_request  # noqa: E402
 
 OPUS = pr.opus_available()
 
@@ -540,3 +540,141 @@ def test_discovery_reply_and_rate_limit():
         u.close()
     finally:
         d.stop()
+
+
+# ------------------------------------------------------------------ pareamento com confirmação no PC
+def auto_handler(answer=True, delay=0.1, seen=None):
+    def handler(name, ip, code, holder):
+        if seen is not None:
+            seen.append((name, ip, code))
+        threading.Timer(delay, holder.answer, args=(answer,)).start()
+    return handler
+
+
+def test_pair_ecdh_both_sides_agree_and_mitm_differs():
+    cpriv, cpub = sec.pair_generate()
+    spriv, spub = sec.pair_generate()
+    c = sec.pair_derive(cpriv, spub, cpub, spub)
+    s = sec.pair_derive(spriv, cpub, cpub, spub)
+    assert c == s and len(c[2]) == 6 and c[2].isdigit()
+    # atacante no meio: cada lado fala com uma chave diferente -> códigos diferentes
+    mpriv, mpub = sec.pair_generate()
+    client_view = sec.pair_derive(cpriv, mpub, cpub, mpub)
+    server_view = sec.pair_derive(spriv, mpub, mpub, spub)
+    assert client_view[2] != server_view[2] and client_view[0] != server_view[0]
+    with pytest.raises(sec.ProtocolError):
+        sec.pair_derive(cpriv, b"\x04" + b"\x01" * 64, cpub, spub)  # ponto fora da curva
+
+
+def test_pairing_approved_then_device_can_connect(env):
+    reg, make = env
+    s, be = make()
+    seen = []
+    s.pair_handler = auto_handler(True, seen=seen)
+    codes = []
+    r = pair_request("127.0.0.1", s.port, "Pixel Novo", on_code=codes.append)
+    assert r["ok"] and r["pcid"] == reg.pcid and r["pcname"]
+    assert seen and seen[0][0] == "Pixel Novo" and seen[0][2] == codes[0] == r["code"]  # o PC mostra o MESMO código
+    d = [x for x in reg.list_devices() if x["pid"] == r["pid"]][0]
+    assert d["active"] and d["name"] == "Pixel Novo"
+    c = client(s, r["pid"], r["psk"])  # a chave recebida funciona para conectar de verdade
+    assert c.request(pr.MODE_MIC)["ok"]
+    c.close()
+    assert s.stats["pairings"] == 1
+
+
+def test_pairing_denied_creates_nothing(env):
+    reg, make = env
+    s, _ = make()
+    s.pair_handler = auto_handler(False)
+    r = pair_request("127.0.0.1", s.port)
+    assert not r["ok"] and "recusado" in r["reason"]
+    assert reg.list_devices() == []
+
+
+def test_pairing_times_out(env, monkeypatch):
+    monkeypatch.setattr(sec, "PAIR_TIMEOUT", 0.6)
+    reg, make = env
+    s, _ = make()
+    answers = []
+
+    def handler(name, ip, code, holder):
+        answers.append(holder)  # ninguém responde
+
+    s.pair_handler = handler
+    r = pair_request("127.0.0.1", s.port)
+    assert not r["ok"] and "tempo" in r["reason"]
+    assert answers[0].event.is_set() and not answers[0].approved  # o diálogo é fechado
+    assert reg.list_devices() == []
+
+
+def test_pairing_disabled_or_without_handler_is_refused(env):
+    reg, make = env
+    s, _ = make()
+    for setup in (lambda: None, lambda: (setattr(s, "pair_handler", auto_handler(True)), setattr(s, "pairing_enabled", False))):
+        setup()
+        sock = socket.create_connection(("127.0.0.1", s.port), timeout=3)
+        priv, cpub = sec.pair_generate()
+        sock.sendall(sec.MAGIC_PAIR + bytes([3]) + cpub + bytes([1]) + b"x")
+        assert closed_by_peer(sock)
+        sock.close()
+    assert reg.list_devices() == []
+
+
+def test_pairing_invalid_public_key_is_refused(env):
+    reg, make = env
+    s, _ = make()
+    s.pair_handler = auto_handler(True)
+    sock = socket.create_connection(("127.0.0.1", s.port), timeout=3)
+    sock.sendall(sec.MAGIC_PAIR + bytes([3]) + b"\x04" + b"\x07" * 64 + bytes([1]) + b"x")
+    assert closed_by_peer(sock)
+    sock.close()
+    assert reg.list_devices() == []
+
+
+def test_pairing_rate_limited_and_one_at_a_time(env):
+    reg, make = env
+    s, _ = make()
+    s.pair_limiter = sec.PairRateLimiter(per_ip=3, total=10)
+    waiting = []
+    s.pair_handler = lambda name, ip, code, holder: waiting.append(holder)  # fica esperando
+    # primeiro pedido fica esperando a aprovação
+    sock1 = socket.create_connection(("127.0.0.1", s.port), timeout=5)
+    p1, c1 = sec.pair_generate()
+    sock1.sendall(sec.MAGIC_PAIR + bytes([3]) + c1 + bytes([1]) + b"a")
+    pr.recv_exact(sock1, 4 + sec.PAIR_PUB_LEN)
+    assert wait_for(lambda: len(waiting) == 1)
+    # segundo pedido simultâneo recebe "em andamento"
+    r2 = pair_request("127.0.0.1", s.port, "b")
+    assert not r2["ok"] and "andamento" in r2["reason"]
+    waiting[0].answer(False)
+    sock1.close()
+    # estourando o limite por origem, o PC nem responde
+    refused = 0
+    for _ in range(4):
+        sock = socket.create_connection(("127.0.0.1", s.port), timeout=3)
+        pk, cp = sec.pair_generate()
+        sock.sendall(sec.MAGIC_PAIR + bytes([3]) + cp + bytes([1]) + b"c")
+        sock.settimeout(2)
+        try:
+            head = sock.recv(4)
+            refused += head == b""
+        except (ConnectionResetError, socket.timeout):
+            refused += 1
+        sock.close()
+    assert refused >= 1
+
+
+def test_pairing_stops_waiting_when_phone_gives_up(env):
+    reg, make = env
+    s, _ = make()
+    holders = []
+    s.pair_handler = lambda name, ip, code, holder: holders.append(holder)
+    sock = socket.create_connection(("127.0.0.1", s.port), timeout=5)
+    pk, cp = sec.pair_generate()
+    sock.sendall(sec.MAGIC_PAIR + bytes([3]) + cp + bytes([1]) + b"z")
+    pr.recv_exact(sock, 4 + sec.PAIR_PUB_LEN)
+    assert wait_for(lambda: len(holders) == 1)
+    sock.close()  # o celular desistiu
+    assert wait_for(lambda: holders[0].event.is_set(), 3)  # o diálogo no PC é fechado
+    assert reg.list_devices() == []
